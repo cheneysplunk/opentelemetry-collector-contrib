@@ -1,0 +1,41 @@
+receivers:
+  filelog:
+    include:
+      - /home/chli/otel/opentelemetry-collector-contrib/exporter/splunktcpoutexporter/demo/mock1000_1mb.log
+    start_at: beginning
+    poll_interval: 50ms
+    # Each line is ~1 MB; raise max_log_size above the 1 MiB default to avoid splits
+    max_log_size: 2097152     # 2 MiB
+    attributes:
+      splunk.sourcetype: perf_test_1mb
+      splunk.source: demo/mock1000_1mb.log
+    resource:
+      host.name: demo-otel-host
+
+exporters:
+  splunktcpout:
+    host: 10.236.40.125
+    port: 9997
+    index: main
+    default_sourcetype: perf_test_1mb
+    default_source: demo/mock1000_1mb.log
+    default_host: demo-otel-host
+    drain_seconds: 60         # generous drain — 1 GB takes ~25 s at 40 MB/s
+    splunk_home: /home/chli/splunk_home
+
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: localhost
+                port: 8889
+    logs:
+      level: info
+
+  pipelines:
+    logs:
+      receivers: [filelog]
+      exporters: [splunktcpout]

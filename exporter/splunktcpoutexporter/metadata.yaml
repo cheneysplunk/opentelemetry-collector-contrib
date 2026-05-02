@@ -1,0 +1,14 @@
+type: splunktcpout
+display_name: Splunk S2S TCP Output Exporter
+
+status:
+  class: exporter
+  stability:
+    development: [logs]
+  distributions: []
+  codeowners:
+    active: []
+
+tests:
+  skip_lifecycle: true
+  skip_shutdown: true

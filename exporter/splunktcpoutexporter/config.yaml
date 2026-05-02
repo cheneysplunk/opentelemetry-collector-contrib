@@ -1,0 +1,60 @@
+# OTel Collector configuration — filelog receiver → Splunk S2S TCP output
+#
+# Pipeline:
+#   filelog receiver  reads demo/mock.log line-by-line
+#       → splunktcpout exporter  forwards each line to Splunk via native S2S
+#       → debug exporter         prints each record to stdout (optional)
+#
+# Run:
+#   LD_LIBRARY_PATH=/home/chli/main/src/output/tcpout_lib:/home/chli/splunk_home/lib \
+#   SPLUNK_HOME=/home/chli/splunk_home \
+#   ./demo/bin/splunktcpout-demo-col --config config.yaml
+
+receivers:
+  filelog:
+    # Tail the mock log file; change to your real log path(s) as needed.
+    include:
+      - /home/chli/otel/opentelemetry-collector-contrib/exporter/splunktcpoutexporter/demo/mock.log
+    # Read from the beginning of the file so pre-seeded lines are picked up.
+    start_at: beginning
+    # Poll every 500 ms for new lines written by gen_mock_log.sh.
+    poll_interval: 500ms
+    # Attach log.file.path to every record for traceability.
+    include_file_path: true
+    # These attributes are stamped on every log record produced by this receiver.
+    # The splunktcpout exporter reads splunk.sourcetype and splunk.source directly.
+    attributes:
+      splunk.sourcetype: filelog_demo
+      splunk.source: demo/mock.log
+    # Resource attributes apply to all records within this resource scope.
+    # host.name is picked up by the exporter as the S2S "host" field.
+    resource:
+      host.name: demo-otel-host
+
+exporters:
+  # ── Splunk S2S TCP output ───────────────────────────────────────────────────
+  splunktcpout:
+    # Destination Splunk indexer (from tcpout_lib.md benchmark config).
+    host: 10.236.40.125
+    port: 9997
+    # Target index. Override per-event via the splunk.index log attribute.
+    index: main
+    # Fallbacks used when a log record has no matching attribute.
+    default_source: demo/mock.log
+    default_sourcetype: filelog_demo
+    default_host: demo-otel-host
+    # Seconds tcpout_destroy() waits for the send queue to drain on shutdown.
+    drain_seconds: 5
+    # Sets SPLUNK_HOME before the C library initialises (must contain etc/).
+    splunk_home: /home/chli/splunk_home
+
+  # ── Debug exporter (stdout) ─────────────────────────────────────────────────
+  # Remove or set verbosity: basic to reduce noise in production.
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs:
+      receivers: [filelog]
+      exporters: [splunktcpout, debug]

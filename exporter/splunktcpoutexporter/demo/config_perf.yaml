@@ -1,0 +1,39 @@
+receivers:
+  filelog:
+    include:
+      - /home/chli/otel/opentelemetry-collector-contrib/exporter/splunktcpoutexporter/demo/mock100000.log
+    start_at: beginning
+    poll_interval: 50ms        # 10× faster than demo config — reduces poll latency
+    attributes:
+      splunk.sourcetype: perf_test_100k
+      splunk.source: demo/mock100000.log
+    resource:
+      host.name: demo-otel-host
+
+exporters:
+  splunktcpout:
+    host: 10.236.40.125
+    port: 9997
+    index: main
+    default_sourcetype: perf_test_100k
+    default_source: demo/mock100000.log
+    default_host: demo-otel-host
+    drain_seconds: 10
+    splunk_home: /home/chli/splunk_home
+
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: localhost
+                port: 8889
+    logs:
+      level: info
+
+  pipelines:
+    logs:
+      receivers: [filelog]
+      exporters: [splunktcpout]

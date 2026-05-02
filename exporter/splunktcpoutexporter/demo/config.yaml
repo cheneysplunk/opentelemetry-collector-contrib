@@ -1,0 +1,53 @@
+# OTel Collector runtime configuration
+#
+# Pipeline: filelog receiver  →  splunktcpout exporter  (+ debug exporter)
+#
+# Run:
+#   LD_LIBRARY_PATH=/home/chli/main/src/output/tcpout_lib:/home/chli/splunk_home/lib \
+#   SPLUNK_HOME=/home/chli/splunk_home \
+#   ./bin/splunktcpout-demo-col --config config.yaml
+
+receivers:
+  filelog:
+    include:
+      - /home/chli/otel/opentelemetry-collector-contrib/exporter/splunktcpoutexporter/demo/mock1000.log
+    start_at: beginning
+    poll_interval: 500ms
+    include_file_path: true
+    # Splunk metadata applied to every log record from this receiver.
+    # Individual records may override these via their own attributes.
+    attributes:
+      splunk.sourcetype: filelog_demo
+      splunk.source: demo/mock.log
+    resource:
+      host.name: demo-otel-host
+
+exporters:
+  # Splunk S2S TCP output — forwards log records to the indexer via native S2S.
+  splunktcpout:
+    host: 10.236.40.125
+    port: 9997
+    index: main
+    default_source: demo/mock.log
+    default_sourcetype: filelog_demo
+    default_host: demo-otel-host
+    drain_seconds: 5
+    splunk_home: /home/chli/splunk_home
+
+  # Debug exporter — prints each record to stdout so you can confirm delivery.
+  debug:
+    verbosity: detailed
+
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: localhost
+                port: 8889   # 8888 is already in use on this host
+  pipelines:
+    logs:
+      receivers: [filelog]
+      exporters: [splunktcpout, debug]
