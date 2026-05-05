@@ -1,0 +1,36 @@
+# Binary A runtime config: splunktailreceiver → OTLP HTTP → Binary B
+#
+# Run:
+#   LD_LIBRARY_PATH=/home/chli/main/src/input/tail_lib:/home/chli/splunk_home/lib \
+#   SPLUNK_HOME=/home/chli/splunk_home \
+#   ./binA/splunktail-col --config config-A.yaml
+
+receivers:
+  splunktail:
+    splunk_home: /home/chli/splunk_home
+    default_sourcetype: tailin_e2e
+    default_index: main
+    monitors:
+      - glob: /tmp/e2e_fresh_*.log
+        sourcetype: tailin_e2e
+
+exporters:
+  otlphttp:
+    endpoint: http://localhost:4318
+    tls:
+      insecure: true
+
+  debug:
+    verbosity: detailed
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: none
+
+  pipelines:
+    logs:
+      receivers: [splunktail]
+      exporters: [otlphttp, debug]

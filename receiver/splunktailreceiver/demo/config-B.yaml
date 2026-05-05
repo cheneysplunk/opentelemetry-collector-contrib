@@ -1,0 +1,38 @@
+# Binary B runtime config: OTLP HTTP receiver → splunktcpoutexporter → Splunk
+#
+# Run:
+#   LD_LIBRARY_PATH=/home/chli/main/src/output/tcpout_lib:/home/chli/splunk_home/lib \
+#   SPLUNK_HOME=/home/chli/splunk_home \
+#   ./binB/splunktcpout-otlp-col --config config-B.yaml
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: localhost:4318
+
+exporters:
+  splunktcpout:
+    host: 10.236.40.125
+    port: 9997
+    index: main
+    default_sourcetype: tailin_e2e
+    default_source: e2e_test.log
+    default_host: e2e-tailin-host
+    drain_seconds: 10
+    splunk_home: /home/chli/splunk_home
+
+  debug:
+    verbosity: detailed
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: none
+
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [splunktcpout, debug]

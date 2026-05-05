@@ -1,0 +1,19 @@
+# Builder config for Binary A: splunktailreceiver → OTLP HTTP exporter
+#
+# This binary reads a file via the Splunk tail library and forwards events
+# as OTLP to Binary B (which sends them on to the Splunk indexer via S2S).
+
+dist:
+  module: github.com/open-telemetry/opentelemetry-collector-contrib/cmd/splunktail-col
+  name: splunktail-col
+  description: "E2E binary A: splunktailreceiver → OTLP HTTP"
+  version: 0.0.1-dev
+  output_path: ./binA
+
+receivers:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunktailreceiver v0.0.1
+    path: /home/chli/otel/opentelemetry-collector-contrib/receiver/splunktailreceiver
+
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.151.1-0.20260501001745-24aecacf1c04
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.151.1-0.20260501001745-24aecacf1c04
