@@ -28,6 +28,116 @@ The OTel extension design replicates this.
 
 ---
 
+## Three options for a single-process pipeline
+
+The immediate goal is to connect `splunktailreceiver` and `splunktcpoutexporter`
+inside **one OTel Collector process** — eliminating the two-binary OTLP bridge and
+enabling direct validation that unparsed raw bytes (not pre-parsed strings) can flow
+through an OTel pipeline end-to-end. Three approaches resolve the singleton conflict
+at different levels of implementation effort.
+
+### Option A — `-fvisibility=hidden` (self-contained libraries)
+
+Add `-fvisibility=hidden -fvisibility-inlines-hidden` to the compiler flags for
+both `.so` builds:
+
+```makefile
+# In tail_lib/Makefile and tcpout_lib/Makefile
+CXXFLAGS += -fvisibility=hidden -fvisibility-inlines-hidden
+```
+
+With hidden visibility, `SplunkMainThread::_instance` is no longer a
+default-visibility ELF symbol. The dynamic linker stops deduplicating it —
+each `.so` gets its own private copy. `tailin_create()` sets its own `_instance`;
+`tcpout_create()` sets its own separate `_instance`; no conflict.
+
+Any symbols that must be visible across the `.so` boundary (the C ABI entry points)
+need an explicit annotation:
+
+```cpp
+__attribute__((visibility("default"))) void tailin_create(...);
+```
+
+In practice this is only the `extern "C"` functions in each `_cabi.cpp` file —
+a small surface.
+
+**Performance implication:** each library still runs its own `EventLoop`. The
+tailin `.so` runs a full `SplunkMainThread` EventLoop; the tcpout `.so` runs a
+per-worker EventLoop. These are independent reactors in the same process —
+redundant timer/poll cycles, extra threads, and duplicated in-memory state. No
+serialization overhead (shared process memory), but more CPU and RSS than a
+single shared EventLoop would require.
+
+### Option B — OTel extension as a shared runtime resource
+
+Port `SplunkMainThread` (and its owned threads) into a dedicated OTel
+**extension** — `splunkframeworkextension`. By OTel design, extensions are
+process-level singletons with an explicit `Start()`/`Shutdown()` lifecycle,
+discoverable by other components via `host.GetExtensions()`. This mirrors exactly
+how `Loader.cpp` works: one framework init, then modules attach.
+
+Both `tailin_create()` and `tcpout_create()` are changed to detect an already-running
+`SplunkMainThread` and skip their own bootstrap. The extension owns the single
+`EventLoop`; both components share it.
+
+Other shared splunkd subsystems (SSL, HTTP, conf management) can be added as
+additional extensions in layers — see [Approach A — OTel Extensions](#approach-a--otel-extensions-incremental-porting) below.
+
+**Performance implication:** one `EventLoop` drives all components — no redundant
+reactors, no duplicated state. This is the most efficient single-process design.
+The tradeoff is implementation complexity: each shared subsystem requires a new
+extension with explicit lifecycle and ownership.
+
+### Option C — Run splunkd as an OTel sidecar process
+
+Run a real splunkd process alongside the OTel Collector and connect them via a
+standard protocol (S2S, HEC, or OTLP). No CGo changes, no porting — the boundary
+is a wire protocol.
+
+**Performance implication:** every event crosses a process boundary — serialization,
+a loopback TCP round-trip, and deserialization. Latency is sub-millisecond on
+loopback but nonzero, and throughput is bounded by the IPC socket. Two separate
+processes also means two copies of the Splunk framework in memory.
+
+### Option D — Rewrite the C++ components in Go
+
+Replace `libtailinput_cabi.so` and `libtcpout_cabi.so` with pure Go implementations,
+eliminating CGo and the Splunk C++ framework entirely.
+
+This faces the same structural problems as Options A and B:
+
+- **Singleton / shared-state problem** — the Go implementations still need a shared
+  process-level reactor (goroutine scheduler + channel infrastructure) and coordinated
+  shutdown. The problem shifts from `SplunkMainThread` to designing equivalent
+  Go-native shared resources — Options A and B are still the relevant design patterns,
+  just expressed in Go instead of C++.
+- **Feature parity** — the Splunk tail library implements decades of production-hardened
+  behaviour: fishbucket (tail-position persistence across restarts), props/transforms
+  pipeline (`LineBreaker`, `HeaderProcessing`, `QueueInputProcessor`), `TailManager`
+  file-rotation and inode-tracking logic, and the full S2S wire protocol in tcpout.
+  Reproducing this in Go is a large, long-running effort with significant risk of
+  subtle behavioural divergence.
+
+**Performance implication:** a pure Go implementation would have the lowest runtime
+overhang (no CGo call overhead, Go GC, no C++ framework threads). But this benefit
+is only realised after full feature parity is achieved — which is the hard part.
+
+### Comparison
+
+| | Performance overhead | Implementation complexity | OTel compatibility |
+|---|---|---|---|
+| **Option A** (`-fvisibility=hidden`) | **High** — duplicated `EventLoop` per library; extra threads, extra memory, redundant poll cycles | **Low** — build flag only; no C++ changes | **Medium** — each lib is isolated; no shared OTel lifecycle; awkward to coordinate shutdown |
+| **Option B** (OTel extensions) | **Low** — single shared `EventLoop`; minimal overhead | **High** — must port each shared subsystem as a new extension with explicit ownership | **High** — native OTel model; extensions compose cleanly; pipelines share resources correctly |
+| **Option C** (splunkd sidecar) | **Medium** — IPC serialization cost per event; two processes; two framework copies in memory | **Low** — no porting required; splunkd runs as-is | **Low** — protocol boundary only; OTel cannot introspect or compose Splunk internals |
+| **Option D** (Go rewrite) | **Low** (once done) — no CGo overhead, no C++ framework threads | **Very High** — full feature parity (fishbucket, transforms, S2S protocol, rotation logic) is a large multi-year effort; same shared-state design questions as A/B still apply | **High** — pure Go, native OTel model, no CGo boundary |
+
+**Recommended starting point:** Option B, Layer 0 only (`splunkframeworkextension`).
+One extension, one `SplunkMainThread`, minimal C++ change to both cabi wrappers.
+This unblocks the single-process pipeline with the lowest performance overhead and
+a clean OTel-native ownership model.
+
+---
+
 ## Splunk component hierarchy
 
 | Component | What it is | Where it lives |
@@ -293,10 +403,12 @@ that replaces the UF without requiring a Splunk installation.
 
 ## Summary: which approach when
 
-| Goal | Recommended approach |
-|---|---|
-| Get tail reading + S2S forwarding working now | **Two-binary OTLP bridge** (already working) |
-| Single OTel binary, minimal code change | **Option B: `try/catch` in `tcpout_cabi.cpp`** (one line) |
-| Single OTel binary, clean ownership | **`splunkframeworkextension` (Layer 0 only)** |
-| Full Splunk capabilities in OTel pipeline | **Approach B (splunkd sidecar) short-term** |
-| Replace UF entirely with OTel binary | **Approach A, all layers** (significant porting work) |
+| Goal | Option | Recommended approach |
+|---|---|---|
+| Get tail reading + S2S forwarding working now | — | **Two-binary OTLP bridge** (already working) |
+| Single binary, minimal code change, quickest unblock | **Option A** | `-fvisibility=hidden` on both `.so` builds — no C++ changes |
+| Single binary, clean OTel ownership, best performance | **Option B** | `splunkframeworkextension` (Layer 0 only) — shared `SplunkMainThread` |
+| Single binary, full Splunk capabilities, no porting | **Option C** | splunkd sidecar — connect via S2S / HEC / OTLP |
+| Incrementally add more Splunk subsystems to OTel | **Option B** | Add extension layers 1–3 (SSL, HTTP, conf) as needed |
+| Replace UF entirely, no Splunk installation required | **Option B** | All layers fully ported |
+| Long-term: eliminate C++ / CGo dependency entirely | **Option D** | Rewrite in Go — same shared-state design questions as A/B apply; full feature parity is a large multi-year effort |
