@@ -92,14 +92,12 @@ func (r *splunktailReceiver) Start(_ context.Context, host component.Host) error
 	}
 
 	var fw splunkapi.SplunkFramework
-	for _, ext := range host.GetExtensions() {
-		if f, ok := ext.(splunkapi.SplunkFramework); ok {
-			fw = f
-			break
-		}
+	ext, ok := host.GetExtensions()[r.cfg.Framework]
+	if !ok {
+		return fmt.Errorf("splunktailreceiver: extension %q not found; add it to service.extensions", r.cfg.Framework)
 	}
-	if fw == nil {
-		return fmt.Errorf("splunktailreceiver: splunkframeworkextension not found; add it to service.extensions")
+	if fw, ok = ext.(splunkapi.SplunkFramework); !ok {
+		return fmt.Errorf("splunktailreceiver: extension %q does not implement splunkapi.SplunkFramework", r.cfg.Framework)
 	}
 
 	p, err := fw.NewPipeline(splunkapi.PipelineConfig{

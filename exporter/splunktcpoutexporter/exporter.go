@@ -61,14 +61,12 @@ func buildOutputsConf(cfg *Config) string {
 // start locates splunkframeworkextension and opens the S2S pipeline.
 func (e *splunktcpoutExporter) start(_ context.Context, host component.Host) error {
 	var fw splunkapi.SplunkFramework
-	for _, ext := range host.GetExtensions() {
-		if f, ok := ext.(splunkapi.SplunkFramework); ok {
-			fw = f
-			break
-		}
+	ext, ok := host.GetExtensions()[e.cfg.Framework]
+	if !ok {
+		return fmt.Errorf("splunktcpoutexporter: extension %q not found; add it to service.extensions", e.cfg.Framework)
 	}
-	if fw == nil {
-		return fmt.Errorf("splunktcpoutexporter: splunkframeworkextension not found; add it to service.extensions")
+	if fw, ok = ext.(splunkapi.SplunkFramework); !ok {
+		return fmt.Errorf("splunktcpoutexporter: extension %q does not implement splunkapi.SplunkFramework", e.cfg.Framework)
 	}
 
 	p, err := fw.NewPipeline(splunkapi.PipelineConfig{

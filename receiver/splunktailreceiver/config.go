@@ -6,6 +6,8 @@ package splunktailreceiver // import "github.com/open-telemetry/opentelemetry-co
 import (
 	"errors"
 	"fmt"
+
+	"go.opentelemetry.io/collector/component"
 )
 
 // MonitorConfig describes a single file-glob to watch.
@@ -28,6 +30,10 @@ type MonitorConfig struct {
 
 // Config defines configuration for the Splunk tail-input receiver.
 type Config struct {
+	// Framework is the component ID of the splunkframeworkextension to use.
+	// Defaults to "splunkframework". Must be listed in service.extensions.
+	Framework component.ID `mapstructure:"framework"`
+
 	// Monitors is the list of file globs to watch. At least one is required.
 	Monitors []MonitorConfig `mapstructure:"monitors"`
 
@@ -55,6 +61,9 @@ type Config struct {
 
 // Validate checks that the configuration is well-formed.
 func (c *Config) Validate() error {
+	if c.Framework == (component.ID{}) {
+		return fmt.Errorf("splunktailreceiver: framework must not be empty; set it to the extension id (e.g. splunkframework)")
+	}
 	if len(c.Monitors) == 0 {
 		return errors.New("splunktailreceiver: at least one monitor must be configured")
 	}

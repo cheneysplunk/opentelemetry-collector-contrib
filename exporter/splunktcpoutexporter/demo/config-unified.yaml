@@ -11,6 +11,7 @@ extensions:
 
 receivers:
   splunktail:
+    framework: splunkframework
     splunk_home: /home/chli/splunk_home
     default_sourcetype: tailin_e2e
     default_index: main
@@ -20,6 +21,7 @@ receivers:
 
 exporters:
   splunktcpout:
+    framework: splunkframework
     host: 10.236.40.125
     port: 9997
     index: main

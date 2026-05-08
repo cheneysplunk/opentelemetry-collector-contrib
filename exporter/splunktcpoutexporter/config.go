@@ -3,7 +3,12 @@
 
 package splunktcpoutexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/splunktcpoutexporter"
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+
+	"go.opentelemetry.io/collector/component"
+)
 
 const (
 	// DefaultPort is the standard Splunk S2S receive port.
@@ -18,6 +23,10 @@ const (
 
 // Config defines configuration for the Splunk S2S TCP output exporter.
 type Config struct {
+	// Framework is the component ID of the splunkframeworkextension to use.
+	// Defaults to "splunkframework". Must be listed in service.extensions.
+	Framework component.ID `mapstructure:"framework"`
+
 	// Host is the Splunk indexer hostname or IP address. Required.
 	Host string `mapstructure:"host"`
 
@@ -55,6 +64,9 @@ type Config struct {
 
 // Validate checks the configuration for required fields and sane values.
 func (c *Config) Validate() error {
+	if c.Framework == (component.ID{}) {
+		return fmt.Errorf("splunktcpoutexporter: framework must not be empty; set it to the extension id (e.g. splunkframework)")
+	}
 	if c.Host == "" {
 		return errors.New("host is required")
 	}
