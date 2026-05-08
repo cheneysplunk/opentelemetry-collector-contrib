@@ -1,0 +1,14 @@
+display_name: Splunk Framework Extension
+type: splunkframework
+
+status:
+  class: extension
+  stability:
+    development: [extension]
+  distributions: []
+  codeowners:
+    active: []
+
+tests:
+  config:
+    splunk_home: /opt/splunk

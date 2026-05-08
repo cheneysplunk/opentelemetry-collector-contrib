@@ -5,37 +5,10 @@
 
 package splunktailreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunktailreceiver"
 
-/*
-// tailin_cabi.h is vendored from main/src/input/tail_lib/tailin_cabi.h.
-// Provide its include path at build time via:
-//   CGO_CFLAGS="-I/path/to/tail_lib"
-// and the library path via:
-//   CGO_LDFLAGS="-L/path/to/tail_lib -L/path/to/splunk_home/lib \
-//                -Wl,-rpath,/path/to/tail_lib \
-//                -Wl,-rpath,/path/to/splunk_home/lib"
-
-#cgo CFLAGS: -I${SRCDIR}
-#cgo LDFLAGS: -ltailinput_cabi -lstdc++ -ldl -lpthread
-
-#include "tailin_cabi.h"
-#include <stdlib.h>
-
-// Forward declaration for the Go-exported callback trampoline.
-// Note: CGo exports drop 'const', so the declaration must use non-const char*.
-extern void goTailinEventCallback(
-	char* data, size_t len,
-	char* source, char* sourcetype,
-	char* host, time_t event_time, void* userdata);
-*/
-import "C"
-
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
-	"time"
-	"unsafe"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
@@ -43,93 +16,23 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/receiver"
 	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/splunkframeworkextension/splunkapi"
 )
 
-// -----------------------------------------------------------------------------
-// Global callback slot
-//
-// tailin_create() is a process-singleton: the C library bootstraps global
-// singletons on the first call and reuses them on subsequent calls.
-// Because CGo does not allow passing Go pointers containing Go pointers as
-// userdata, we store the active receiver in a global and use a fixed sentinel
-// as the userdata value (any non-nil value distinguishes "registered" from
-// "not registered").
-// -----------------------------------------------------------------------------
-
-var (
-	globalReceiverMu sync.RWMutex
-	globalReceiver   *splunktailReceiver
-)
-
-func setGlobalReceiver(r *splunktailReceiver) {
-	globalReceiverMu.Lock()
-	defer globalReceiverMu.Unlock()
-	globalReceiver = r
-}
-
-func clearGlobalReceiver() {
-	globalReceiverMu.Lock()
-	defer globalReceiverMu.Unlock()
-	globalReceiver = nil
-}
-
-// -----------------------------------------------------------------------------
-// CGo callback trampoline — called from the parsing-pipeline C thread.
-// -----------------------------------------------------------------------------
-
-//export goTailinEventCallback
-func goTailinEventCallback(
-	data *C.char, dataLen C.size_t,
-	source *C.char, sourcetype *C.char,
-	host *C.char, eventTime C.time_t,
-	_ unsafe.Pointer,
-) {
-	globalReceiverMu.RLock()
-	r := globalReceiver
-	globalReceiverMu.RUnlock()
-	if r == nil {
-		return
-	}
-
-	raw := C.GoStringN(data, C.int(dataLen))
-	if len(raw) == 0 {
-		return // sentinel flush event — skip
-	}
-
-	src := C.GoString(source)
-	st := C.GoString(sourcetype)
-	h := C.GoString(host)
-	ts := time.Unix(int64(eventTime), 0)
-
-	ld := plog.NewLogs()
-	rl := ld.ResourceLogs().AppendEmpty()
-	rl.Resource().Attributes().PutStr("host.name", h)
-	sl := rl.ScopeLogs().AppendEmpty()
-	sl.Scope().SetName("splunktail")
-	lr := sl.LogRecords().AppendEmpty()
-	lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
-	lr.Body().SetStr(raw)
-	lr.Attributes().PutStr("splunk.source", src)
-	lr.Attributes().PutStr("splunk.sourcetype", st)
-
-	if err := r.nextConsumer.ConsumeLogs(r.ctx, ld); err != nil {
-		r.logger.Warn("ConsumeLogs error", zap.Error(err))
-	}
-}
-
-// -----------------------------------------------------------------------------
-// Receiver implementation
-// -----------------------------------------------------------------------------
-
+// splunktailReceiver implements receiver.Logs using the Splunk tail pipeline
+// exposed by splunkframeworkextension via the splunkapi.SplunkFramework
+// interface.  No CGo in this file — all C library calls live in the extension.
 type splunktailReceiver struct {
 	cfg          *Config
 	logger       *zap.Logger
 	nextConsumer consumer.Logs
 
-	handle *C.TailinHandle
+	tailInput splunkapi.TailInput
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 	mu     sync.Mutex
 }
 
@@ -146,125 +49,115 @@ func newLogsReceiver(
 	}, nil
 }
 
-func (r *splunktailReceiver) Start(_ context.Context, _ component.Host) error {
+// Start locates splunkframeworkextension from the collector host, creates a
+// TailInput session, registers all configured monitors, and launches the
+// consumer goroutine.
+func (r *splunktailReceiver) Start(_ context.Context, host component.Host) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.handle != nil {
+	if r.tailInput != nil {
 		return nil // already started
 	}
 
-	if r.cfg.SplunkHome != "" {
-		if err := os.Setenv("SPLUNK_HOME", r.cfg.SplunkHome); err != nil {
-			return fmt.Errorf("splunktailreceiver: set SPLUNK_HOME: %w", err)
+	// Locate the extension that implements SplunkFramework.
+	var fw splunkapi.SplunkFramework
+	for _, ext := range host.GetExtensions() {
+		if f, ok := ext.(splunkapi.SplunkFramework); ok {
+			fw = f
+			break
 		}
 	}
-
-	// Build TailinConfig from our Go config.
-	ccfg := C.tailin_default_config()
-	if r.cfg.DefaultSourcetype != "" {
-		cs := C.CString(r.cfg.DefaultSourcetype)
-		defer C.free(unsafe.Pointer(cs))
-		ccfg.default_sourcetype = cs
-	}
-	if r.cfg.DefaultIndex != "" {
-		ci := C.CString(r.cfg.DefaultIndex)
-		defer C.free(unsafe.Pointer(ci))
-		ccfg.default_index = ci
-	}
-	if r.cfg.Host != "" {
-		ch := C.CString(r.cfg.Host)
-		defer C.free(unsafe.Pointer(ch))
-		ccfg.host = ch
-	}
-	if r.cfg.FishbucketDir != "" {
-		cfb := C.CString(r.cfg.FishbucketDir)
-		defer C.free(unsafe.Pointer(cfb))
-		ccfg.fishbucket_dir = cfb
+	if fw == nil {
+		return fmt.Errorf("splunktailreceiver: splunkframeworkextension not found; add it to service.extensions")
 	}
 
-	// Register before create so the callback can find us immediately.
-	r.ctx, r.cancel = context.WithCancel(context.Background())
-	setGlobalReceiver(r)
-
-	handle := C.tailin_create(
-		C.tailin_event_cb(C.goTailinEventCallback),
-		nil, // userdata unused — trampoline reads globalReceiver
-		&ccfg,
-	)
-	if handle == nil {
-		clearGlobalReceiver()
-		r.cancel()
-		return fmt.Errorf("splunktailreceiver: tailin_create failed: %s",
-			C.GoString(C.tailin_last_error()))
+	ti, err := fw.NewTailInput(splunkapi.TailConfig{
+		DefaultSourcetype: r.cfg.DefaultSourcetype,
+		DefaultIndex:      r.cfg.DefaultIndex,
+		Host:              r.cfg.Host,
+		FishbucketDir:     r.cfg.FishbucketDir,
+	})
+	if err != nil {
+		return fmt.Errorf("splunktailreceiver: %w", err)
 	}
 
-	// Register all monitors.
 	for _, m := range r.cfg.Monitors {
-		cglob := C.CString(m.Glob)
-		defer C.free(unsafe.Pointer(cglob))
-
-		var cst, cidx, chost *C.char
-		if m.Sourcetype != "" {
-			cst = C.CString(m.Sourcetype)
-			defer C.free(unsafe.Pointer(cst))
-		}
-		if m.Index != "" {
-			cidx = C.CString(m.Index)
-			defer C.free(unsafe.Pointer(cidx))
-		}
-		if m.Host != "" {
-			chost = C.CString(m.Host)
-			defer C.free(unsafe.Pointer(chost))
-		}
-
-		if rc := C.tailin_add_monitor(handle, cglob, cst, cidx, chost); rc != 0 {
-			C.tailin_destroy(handle)
-			clearGlobalReceiver()
-			r.cancel()
-			return fmt.Errorf("splunktailreceiver: tailin_add_monitor(%s) failed: %s",
-				m.Glob, C.GoString(C.tailin_last_error()))
+		if err := ti.AddMonitor(splunkapi.MonitorConfig{
+			Glob:       m.Glob,
+			Sourcetype: m.Sourcetype,
+			Index:      m.Index,
+			Host:       m.Host,
+		}); err != nil {
+			ti.Destroy()
+			return fmt.Errorf("splunktailreceiver: %w", err)
 		}
 	}
 
-	// Start the tail pipeline.
-	if rc := C.tailin_start(handle); rc != 0 {
-		C.tailin_destroy(handle)
-		clearGlobalReceiver()
-		r.cancel()
-		return fmt.Errorf("splunktailreceiver: tailin_start failed: %s",
-			C.GoString(C.tailin_last_error()))
+	if err := ti.Start(); err != nil {
+		ti.Destroy()
+		return fmt.Errorf("splunktailreceiver: %w", err)
 	}
 
-	r.handle = handle
+	r.ctx, r.cancel = context.WithCancel(context.Background())
+	r.tailInput = ti
+
+	r.wg.Add(1)
+	go r.consumeLoop(r.ctx, ti.Events())
+
 	r.logger.Info("splunktail receiver started",
 		zap.Int("monitors", len(r.cfg.Monitors)),
 	)
 	return nil
 }
 
+// consumeLoop reads TailEvents from the channel and forwards them to the
+// pipeline consumer.  Exits when the channel is closed (by Stop).
+func (r *splunktailReceiver) consumeLoop(ctx context.Context, events <-chan splunkapi.TailEvent) {
+	defer r.wg.Done()
+	for ev := range events {
+		r.deliver(ctx, ev)
+	}
+}
+
+// deliver converts one TailEvent to a plog.Logs and calls ConsumeLogs.
+func (r *splunktailReceiver) deliver(ctx context.Context, ev splunkapi.TailEvent) {
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("host.name", ev.Host)
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("splunktail")
+	lr := sl.LogRecords().AppendEmpty()
+	lr.SetTimestamp(pcommon.NewTimestampFromTime(ev.Time))
+	lr.Body().SetStr(ev.Body)
+	lr.Attributes().PutStr("splunk.source", ev.Source)
+	lr.Attributes().PutStr("splunk.sourcetype", ev.Sourcetype)
+
+	if err := r.nextConsumer.ConsumeLogs(ctx, ld); err != nil {
+		r.logger.Warn("ConsumeLogs error", zap.Error(err))
+	}
+}
+
+// Shutdown stops the tail pipeline and waits for the consumer goroutine.
 func (r *splunktailReceiver) Shutdown(_ context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.handle == nil {
+	if r.tailInput == nil {
 		return nil
 	}
 
-	if r.cancel != nil {
-		r.cancel()
-	}
+	r.cancel()
 
-	handle := r.handle
-	r.handle = nil
+	// Stop closes the Events() channel, which causes consumeLoop to exit.
+	r.tailInput.Stop()
+	r.wg.Wait()
 
-	// Clear global receiver before stop so in-flight callbacks see nil and drop events.
-	clearGlobalReceiver()
-
-	// Stop blocks until all threads exit, then destroy frees memory.
-	C.tailin_stop(handle)
-	C.tailin_destroy(handle)
+	r.tailInput.Destroy()
+	r.tailInput = nil
 
 	r.logger.Info("splunktail receiver shut down")
 	return nil
 }
+
+

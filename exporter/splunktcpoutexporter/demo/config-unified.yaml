@@ -1,9 +1,9 @@
-# Binary A runtime config: splunkframeworkextension + splunktailreceiver → OTLP HTTP
+# Unified runtime config: splunktailreceiver → splunktcpoutexporter (single process)
 #
 # Run:
 #   LD_LIBRARY_PATH=/home/chli/main/src/framework_cabi:/home/chli/splunk_home/lib \
 #   SPLUNK_HOME=/home/chli/splunk_home \
-#   ./binA/splunktail-col --config config-A.yaml
+#   ./bin-unified/splunk-col --config config-unified.yaml
 
 extensions:
   splunkframework:
@@ -19,10 +19,15 @@ receivers:
         sourcetype: tailin_e2e
 
 exporters:
-  otlphttp:
-    endpoint: http://localhost:4318
-    tls:
-      insecure: true
+  splunktcpout:
+    host: 10.236.40.125
+    port: 9997
+    index: main
+    default_source: /tmp/e2e_fresh_*.log
+    default_sourcetype: tailin_e2e
+    default_host: ufcompo
+    drain_seconds: 5
+    splunk_home: /home/chli/splunk_home
 
   debug:
     verbosity: detailed
@@ -39,4 +44,4 @@ service:
   pipelines:
     logs:
       receivers: [splunktail]
-      exporters: [otlphttp, debug]
+      exporters: [splunktcpout, debug]

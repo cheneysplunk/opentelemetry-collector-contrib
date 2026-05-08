@@ -19,7 +19,7 @@ import (
 func main() {
 	info := component.BuildInfo{
 		Command:     "splunktail-col",
-		Description: "E2E binary A: splunktailreceiver → OTLP HTTP",
+		Description: "splunktailreceiver + splunkframeworkextension → OTLP HTTP",
 		Version:     "0.0.1-dev",
 	}
 

@@ -194,23 +194,43 @@ via the `splunk_home:` field in the exporter config.
 
 ## Benchmark results
 
-Three S2S implementations compared: `10.236.40.125:9997`, non-SSL, `index=main`.
-Throughput = wire TX bytes ÷ active window, measured via `/proc/net/dev` TX counters.
-`tcpout` config: `maxQueueSize=512 KB`, `maxConnectionsPerIndexer=2` (minimal/test
-settings — production tuning scales throughput proportionally).
+### Column definitions
 
-| Payload | Metric | C++ `tcpout_sender` | Go CGo `go_tcpout` | OTel e2e |
-|---------|--------|:-------------------:|:-----------------:|:--------:|
-| **100 000 × 1 KB** | Wire throughput | 15.7 MB/s | 24.5 MB/s | **31.5 MB/s** |
-| | CPU | 8.9 s | **2.1 s** | 2.3 s |
-| | Peak RSS | **45 MB** | 56 MB | 80 MB |
-| | Active window | 7 440 ms | 4 969 ms | **2 534 ms** |
-| **1 000 × 1 MB** | Wire throughput | 24.9 MB/s | 24.8 MB/s | **28.2 MB/s** |
-| | CPU | 26.2 s | **3.0 s** | **3.0 s** |
-| | Peak RSS | **48 MB** | 83 MB | 485 MB |
-| | Active window | 41 359 ms | 41 396 ms | **34 143 ms** |
+| Column | Binary | Framework |
+|--------|--------|-----------|
+| `C++ tcpout_sender` | standalone C++ sender | `EmptyMainThread` stub |
+| `Go CGo go_tcpout` | standalone Go CGo sender | `EmptyMainThread` stub |
+| `OTel e2e` | filelog → splunktcpout (no extension) | `EmptyMainThread` stub |
+| `OTel + framework` | filelog → splunktcpout + `splunkframeworkextension` | full `SplunkMainThread` |
 
-> **Host:** `ufcompo` (Linux, 32 vCPU) · **Date:** 2026-05-02
+Throughput for the first three columns measured via `/proc/net/dev` TX counters (all
+interface TX).  The "OTel + framework" column uses **`tcpdump`** capturing only TCP
+traffic to port 9997, which is the more accurate method — it counts actual bytes
+delivered to the indexer and ignores unrelated interface traffic.  `tcpout` config:
+`maxQueueSize=512 KB`, `maxConnectionsPerIndexer=2` (minimal/test settings).
+
+### Results
+
+| Payload | Metric | C++ `tcpout_sender` | Go CGo `go_tcpout` | OTel e2e | OTel + framework<br>(queue=512KB, conn=2) | OTel + framework<br>(queue=8MB, conn=4) |
+|---------|--------|:-------------------:|:-----------------:|:--------:|:-----------------------------------------:|:---------------------------------------:|
+| **100 000 × 1 KB** | Wire throughput | 15.7 MB/s | 24.5 MB/s | 31.5 MB/s | 11.9 MB/s | **31.9 MB/s** |
+| | Active window | 7 440 ms | 4 969 ms | 2 534 ms | 8 766 ms | **2 593 ms** |
+| | CPU time | 8.9 s | 2.1 s | 2.3 s | — | **3.2 s** |
+| | Peak RSS | **45 MB** | 56 MB | 80 MB | 89 MB | 101 MB |
+| | Peak PSS | — | — | — | 85 MB | **97 MB** |
+| **1 000 × 1 MB** | Wire throughput | 24.9 MB/s | 24.8 MB/s | 28.2 MB/s | 20.4 MB/s | **20.3 MB/s** |
+| | Active window | 41 359 ms | 41 396 ms | 34 143 ms | 49 018 ms | **48 823 ms** |
+| | CPU time | 26.2 s | 3.0 s | 3.0 s | — | **2.4 s** |
+| | Peak RSS | **48 MB** | 83 MB | 485 MB | 474 MB | **518 MB** |
+| | Peak PSS | — | — | — | 471 MB | **514 MB** |
+
+> **Host:** `ufcompo` (Linux, 32 vCPU) · **Date (first three cols):** 2026-05-02 · **Date (OTel+framework cols):** 2026-05-08
+
+> **PSS vs RSS:** RSS counts shared-library pages in full per process; PSS
+> (Proportional Set Size) divides shared pages by the number of processes sharing them.
+> Since `libsplunk_cabi.so` is loaded by exactly one process, PSS ≈ RSS — the ~4 MB
+> gap is Go runtime and libc pages shared with the shell ancestor.  PSS is reported
+> because it becomes meaningful when multiple collector instances share the same `.so`.
 
 ### Why the throughput ordering differs
 
@@ -246,5 +266,60 @@ still contributes a modest 13% edge (28.2 MB/s) by overlapping parse of the next
 with the current send.  The main surviving difference is **RSS**: OTel buffers multiple
 1 MB records in Go heap simultaneously → 485 MB; Go CGo holds one at a time → 83 MB;
 C++ has no Go heap → 48 MB.
+
+**4 — OTel + framework throughput regression: SplunkMainThread CPU contention**
+
+The "OTel + framework" column is **2.6× slower at 1 KB** (11.9 vs 31.5 MB/s) and
+**28% slower at 1 MB** (20.4 vs 28.2 MB/s).  The root cause is CPU contention between
+the framework's background threads and the tcpout sender threads.
+
+`splunkframeworkextension` starts a full `SplunkMainThread` with `forgoProcessRunnerInit=true`
+(skipping the process lifecycle manager), but still launches the complete internal
+machinery:
+
+| Thread group | Count | Purpose |
+|---|---|---|
+| EventLoop (epoll) | 1 | Conf-change, signal, heartbeat dispatch |
+| Pipeline stage queues | 3–4 | Parsing, typing, indexing queues (all idle but scheduled) |
+| FileTracker / inotify | 2 | Watches all configured `monitor://` stanzas |
+| BulletinBoardManager | 1 | In-memory conf change propagation |
+| Health reporter | 1 | Periodic metrics collection |
+| `SplunkMainThread` itself | 1 | Orchestration loop |
+
+At 1 KB/event, `tcpout_send()` completes in ~37 µs.  The sender threads re-enter the
+OS scheduler frequently enough that the ~10 framework threads compete for scheduler
+time-slices on every drain cycle.  At 1 MB/event the 16 ms drain wait is far larger
+than a scheduler slice — framework threads get scheduled opportunistically and the
+relative cost drops to 28%.
+
+**Improvement plan**
+
+Three levers in rough implementation order:
+
+1. **Increase tcpout queue + connections (tested, fully recovers 1KB throughput)**
+   Raising `maxQueueSize` from 512 KB to 8 MB and `maxConnectionsPerIndexer` from 2
+   to 4 in the C++ init path (`tcpout_cabi.cpp`) fully recovers the 1KB throughput:
+   **11.9 → 31.9 MB/s** (+168%), matching and marginally exceeding the OTel e2e
+   baseline.  The larger queue lets the 4 sender threads stay continuously saturated,
+   eliminating queue-full stalls as the contention window.  The 1MB case is unchanged
+   (**20.3 MB/s**) — it is bottlenecked purely on TCP bandwidth and the per-send drain
+   time is independent of queue size.  RSS increases from 89 MB to 101 MB at 1KB
+   (the 8MB queue is pre-allocated in C++ heap).  This is now the default in
+   `tcpout_cabi.cpp`.
+
+2. **CPU-set isolation (deployment, no code change)**
+   Pin the OTel process to a subset of CPUs away from framework-heavy cores:
+   ```bash
+   taskset -c 0-15 ./splunk-col --config config.yaml
+   ```
+   On a 32-vCPU host this reserves 16 cores for tcpout sender threads and Go
+   goroutines.  On a production host with dedicated vCPUs this is the zero-cost fix.
+
+3. **Reduce framework poll aggressiveness in extension mode (code change)**
+   `EventLoop::enableFastPoll()` is called unconditionally in `splunkfw_cabi.cpp`.
+   In extension mode there are no real inputs to process, so fast poll just burns
+   CPU.  Replacing it with a slower poll interval (e.g., `setDefaultPollInterval(100)`
+   instead of fast mode) should reduce framework thread wake-ups by ~10×.  This
+   requires a small change to `splunkfw_cabi.cpp` and re-linking `libsplunk_cabi.so`.
 
 

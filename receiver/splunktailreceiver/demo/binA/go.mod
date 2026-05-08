@@ -5,6 +5,7 @@ module github.com/open-telemetry/opentelemetry-collector-contrib/cmd/splunktail-
 go 1.25.0
 
 require (
+	github.com/open-telemetry/opentelemetry-collector-contrib/extension/splunkframeworkextension v0.0.1
 	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunktailreceiver v0.0.1
 	go.opentelemetry.io/collector/component v1.57.1-0.20260501001745-24aecacf1c04
 	go.opentelemetry.io/collector/confmap v1.57.0
@@ -17,7 +18,7 @@ require (
 	go.opentelemetry.io/collector/exporter v1.57.0
 	go.opentelemetry.io/collector/exporter/debugexporter v0.151.1-0.20260501001745-24aecacf1c04
 	go.opentelemetry.io/collector/exporter/otlphttpexporter v0.151.1-0.20260501001745-24aecacf1c04
-	go.opentelemetry.io/collector/extension v1.57.0
+	go.opentelemetry.io/collector/extension v1.57.1-0.20260501001745-24aecacf1c04
 	go.opentelemetry.io/collector/otelcol v0.151.0
 	go.opentelemetry.io/collector/processor v1.57.0
 	go.opentelemetry.io/collector/receiver v1.57.0
@@ -159,5 +160,7 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/open-telemetry/opentelemetry-collector-contrib/extension/splunkframeworkextension v0.0.1 => ../../../../extension/splunkframeworkextension
 
 replace github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunktailreceiver v0.0.1 => ../..

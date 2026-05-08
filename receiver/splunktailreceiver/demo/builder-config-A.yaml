@@ -1,14 +1,26 @@
-# Builder config for Binary A: splunktailreceiver → OTLP HTTP exporter
+# Builder config: splunkframeworkextension + splunktailreceiver → debug/OTLP
 #
-# This binary reads a file via the Splunk tail library and forwards events
-# as OTLP to Binary B (which sends them on to the Splunk indexer via S2S).
+# This is the updated single-binary config that uses splunkframeworkextension
+# to initialise the Splunk C++ framework once, shared by the receiver.
+#
+# Build:
+#   ocb --config builder-config-A.yaml
+#
+# Run:
+#   LD_LIBRARY_PATH=/home/chli/main/src/framework_cabi:/home/chli/splunk_home/lib \
+#   ./binA/splunktail-col --config config-A.yaml
 
 dist:
   module: github.com/open-telemetry/opentelemetry-collector-contrib/cmd/splunktail-col
   name: splunktail-col
-  description: "E2E binary A: splunktailreceiver → OTLP HTTP"
+  description: "splunktailreceiver + splunkframeworkextension → OTLP HTTP"
   version: 0.0.1-dev
   output_path: ./binA
+  cgo_enabled: true
+
+extensions:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/splunkframeworkextension v0.0.1
+    path: /home/chli/otel/opentelemetry-collector-contrib/extension/splunkframeworkextension
 
 receivers:
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunktailreceiver v0.0.1

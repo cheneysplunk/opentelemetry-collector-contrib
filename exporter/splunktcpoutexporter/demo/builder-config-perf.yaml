@@ -1,0 +1,32 @@
+# Builder config for tcpout perf test binary
+# Pipeline: filelog receiver → splunktcpout exporter (+ splunkframeworkextension)
+# Measures tcpout throughput and full-process memory with the Splunk framework loaded.
+#
+# The exporter is now pure Go; all CGo lives in the extension.
+# Only CGO_LDFLAGS is needed (no CGO_CFLAGS required).
+#
+# Build:
+#   cd demo/
+#   FW_DIR=/home/chli/main/src/framework_cabi
+#   SPLUNK_HOME=/home/chli/splunk_home
+#   CGO_LDFLAGS="-L${FW_DIR} -lsplunk_cabi -Wl,-rpath,${FW_DIR} -Wl,-rpath,${SPLUNK_HOME}/lib -lstdc++ -ldl -lpthread" \
+#   /home/chli/go/bin/builder --config builder-config-perf.yaml
+
+dist:
+  module: github.com/open-telemetry/opentelemetry-collector-contrib/cmd/splunk-col-perf
+  name: splunk-col-perf
+  description: "perf: filelog → splunktcpout + splunkframeworkextension"
+  version: 0.0.1-dev
+  output_path: ./bin-perf
+  cgo_enabled: true
+
+extensions:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/splunkframeworkextension v0.0.1
+    path: /home/chli/otel/opentelemetry-collector-contrib/extension/splunkframeworkextension
+
+receivers:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.151.0
+
+exporters:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/splunktcpoutexporter v0.0.1
+    path: /home/chli/otel/opentelemetry-collector-contrib/exporter/splunktcpoutexporter

@@ -13,6 +13,7 @@ import (
 	otelconftelemetry "go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 	debugexporter "go.opentelemetry.io/collector/exporter/debugexporter"
 	otlphttpexporter "go.opentelemetry.io/collector/exporter/otlphttpexporter"
+	splunkframeworkextension "github.com/open-telemetry/opentelemetry-collector-contrib/extension/splunkframeworkextension"
 	splunktailreceiver "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunktailreceiver"
 )
 
@@ -37,11 +38,13 @@ func components() (otelcol.Factories, error) {
 	}
 
 	factories.Extensions, err = otelcol.MakeFactoryMap[extension.Factory](
+		splunkframeworkextension.NewFactory(),
 	)
 	if err != nil {
 		return otelcol.Factories{}, err
 	}
 	factories.ExtensionModules = makeModulesMap(factories.Extensions, map[component.Type]string{
+		splunkframeworkextension.NewFactory().Type(): "github.com/open-telemetry/opentelemetry-collector-contrib/extension/splunkframeworkextension v0.0.1",
 	})
 
 	factories.Receivers, err = otelcol.MakeFactoryMap[receiver.Factory](
