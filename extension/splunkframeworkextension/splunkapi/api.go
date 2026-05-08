@@ -1,23 +1,20 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// Package splunkapi defines the pure-Go interfaces that splunkframeworkextension
-// exposes to other components. No CGo, no Splunk headers — import freely on any
-// platform; only the Linux extension implementation uses CGo.
+// Package splunkapi defines the pure-Go interfaces exposed by
+// splunkframeworkextension to other OTel components. No CGo, no Splunk
+// headers — import freely on any platform.
 //
-// Usage in a receiver or exporter:
+// Usage:
 //
 //	func (r *myReceiver) Start(_ context.Context, host component.Host) error {
 //	    var fw splunkapi.SplunkFramework
 //	    for _, ext := range host.GetExtensions() {
-//	        if f, ok := ext.(splunkapi.SplunkFramework); ok {
-//	            fw = f; break
-//	        }
+//	        if f, ok := ext.(splunkapi.SplunkFramework); ok { fw = f; break }
 //	    }
-//	    if fw == nil {
-//	        return errors.New("splunkframeworkextension not found in service.extensions")
-//	    }
-//	    ti, err := fw.NewTailInput(splunkapi.TailConfig{...})
+//	    p, err := fw.NewPipeline(splunkapi.PipelineConfig{
+//	        InputsConf: "[monitor:///var/log/app/*.log]\nsourcetype=myapp\n",
+//	    })
 //	    ...
 //	}
 package splunkapi
@@ -25,57 +22,39 @@ package splunkapi
 import "time"
 
 // SplunkFramework is implemented by splunkframeworkextension.
-// Components retrieve it by iterating host.GetExtensions() and
-// type-asserting to SplunkFramework.
+// Retrieve it by iterating host.GetExtensions() and type-asserting.
 type SplunkFramework interface {
-	// NewTailInput creates a tail-input session backed by the Splunk tail
-	// pipeline (fish-bucket, log-rotation, line-breaking, etc.).
-	// Multiple TailInputs can coexist within one process.
-	NewTailInput(cfg TailConfig) (TailInput, error)
-
-	// NewTcpOutput creates an S2S TCP output session to a Splunk indexer.
-	// Multiple TcpOutputs can coexist (one per indexer target).
-	NewTcpOutput(host string, port int, index string) (TcpOutput, error)
+	// NewPipeline creates a Splunk pipeline from raw conf stanza text.
+	// Either InputsConf or OutputsConf (or both) must be non-empty.
+	NewPipeline(cfg PipelineConfig) (Pipeline, error)
 }
 
-// TailConfig is the top-level configuration for a TailInput session.
-type TailConfig struct {
-	// DefaultSourcetype applied to monitors that don't specify one.
-	// Empty → "tailin".
-	DefaultSourcetype string
+// PipelineConfig holds raw Splunk conf stanza text for each conf file.
+// Standard Splunk .conf syntax: [stanza-header]\nkey = value\n...
+type PipelineConfig struct {
+	// InputsConf is raw inputs.conf stanza text. Empty for output-only.
+	// Supported stanza types (Phase 1): monitor://
+	// Example:
+	//   [monitor:///var/log/*.log]
+	//   sourcetype = myapp
+	//   index = main
+	InputsConf string
 
-	// DefaultIndex applied to monitors that don't specify one.
-	// Empty → "main".
-	DefaultIndex string
+	// OutputsConf is raw outputs.conf stanza text. Empty for input-only.
+	// Example:
+	//   [tcpout]
+	//   defaultGroup = idx
+	//   [tcpout:idx]
+	//   server = 10.0.0.1:9997
+	OutputsConf string
 
-	// Host field value for all events. Empty → local hostname.
-	Host string
-
-	// FishbucketDir is the path to a writable directory for fish-bucket
-	// state files. Empty → $SPLUNK_DB/fishbucket.
-	FishbucketDir string
+	// PropsConf is raw props.conf stanza text. Empty for defaults.
+	// Reserved for Phase 2.
+	PropsConf string
 }
 
-// MonitorConfig describes one file-glob stanza to watch.
-type MonitorConfig struct {
-	// Glob is a shell-style glob or exact path, e.g. "/var/log/*.log".
-	Glob string
-
-	// Sourcetype overrides TailConfig.DefaultSourcetype for this glob.
-	// Empty → inherit default.
-	Sourcetype string
-
-	// Index overrides TailConfig.DefaultIndex for this glob.
-	// Empty → inherit default.
-	Index string
-
-	// Host overrides TailConfig.Host for this glob.
-	// Empty → inherit default.
-	Host string
-}
-
-// TailEvent is a single log event delivered by the Splunk tail pipeline.
-type TailEvent struct {
+// Event is a single log event delivered from an input pipeline.
+type Event struct {
 	Body       string
 	Source     string
 	Sourcetype string
@@ -83,32 +62,26 @@ type TailEvent struct {
 	Time       time.Time
 }
 
-// TailInput is a running tail session.
-type TailInput interface {
-	// AddMonitor registers a glob pattern. Must be called before Start.
-	AddMonitor(cfg MonitorConfig) error
-
-	// Start begins the tail pipeline. Must be called after AddMonitor(s).
+// Pipeline is a running Splunk pipeline session (input, output, or both).
+type Pipeline interface {
+	// Start activates the pipeline. For inputs, events begin arriving via
+	// Events(). For outputs, the TCP connection is established.
 	Start() error
 
-	// Events returns the channel on which TailEvents are delivered.
-	// The channel is closed when Stop+Destroy are called.
-	Events() <-chan TailEvent
+	// Events returns the channel on which input Events are delivered.
+	// Returns a nil channel for output-only pipelines.
+	// The channel is closed when Stop is called.
+	Events() <-chan Event
 
-	// Stop halts the tail pipeline and all background threads.
-	// No more events will be sent after Stop returns.
-	// The Events channel is closed by Stop.
-	Stop()
+	// Send forwards one event through the output side of the pipeline.
+	// Returns an error for input-only pipelines or after Stop is called.
+	Send(body []byte, source, sourcetype, host, index string) error
+
+	// Stop halts inputs (no more events after return), drains outputs
+	// for up to drainSeconds, and closes the Events channel.
+	Stop(drainSeconds int)
 
 	// Destroy frees C-level resources. Must be called after Stop.
 	Destroy()
 }
 
-// TcpOutput is an active S2S session to one Splunk indexer.
-type TcpOutput interface {
-	// Send forwards one event. Metadata fields may be empty strings.
-	Send(body []byte, source, sourcetype, host, index string) error
-
-	// Destroy drains the send queue and closes the TCP connection.
-	Destroy(drainSeconds int)
-}

@@ -21,18 +21,17 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/splunkframeworkextension/splunkapi"
 )
 
-// splunktcpoutExporter implements exporter.Logs using the Splunk S2S TCP
-// output pipeline exposed by splunkframeworkextension via
-// splunkapi.SplunkFramework.  No CGo in this file.
+// splunktcpoutExporter implements exporter.Logs via the generic
+// splunkapi.Pipeline interface — no CGo in this file.
 type splunktcpoutExporter struct {
-	cfg    *Config
-	logger *zap.Logger
-	out    splunkapi.TcpOutput
-	mu     sync.Mutex
+	cfg      *Config
+	logger   *zap.Logger
+	pipeline splunkapi.Pipeline
+	mu       sync.Mutex
 }
 
 // newLogsExporter constructs an exporter.Logs backed by the Splunk S2S library.
-// The TcpOutput session is created lazily in start().
+// The Pipeline session is created lazily in start().
 func newLogsExporter(ctx context.Context, params exporter.Settings, cfg *Config) (exporter.Logs, error) {
 	exp := &splunktcpoutExporter{
 		cfg:    cfg,
@@ -48,7 +47,18 @@ func newLogsExporter(ctx context.Context, params exporter.Settings, cfg *Config)
 	)
 }
 
-// start locates splunkframeworkextension and opens the S2S connection.
+// buildOutputsConf converts structured exporter config into a raw outputs.conf
+// stanza string understood by splunk_pipeline_create().
+func buildOutputsConf(cfg *Config) string {
+	s := fmt.Sprintf("[tcpout]\ndefaultGroup = cabi\n[tcpout:cabi]\nserver = %s:%d\n",
+		cfg.Host, cfg.Port)
+	if cfg.Index != "" {
+		s += "index = " + cfg.Index + "\n"
+	}
+	return s
+}
+
+// start locates splunkframeworkextension and opens the S2S pipeline.
 func (e *splunktcpoutExporter) start(_ context.Context, host component.Host) error {
 	var fw splunkapi.SplunkFramework
 	for _, ext := range host.GetExtensions() {
@@ -61,12 +71,18 @@ func (e *splunktcpoutExporter) start(_ context.Context, host component.Host) err
 		return fmt.Errorf("splunktcpoutexporter: splunkframeworkextension not found; add it to service.extensions")
 	}
 
-	out, err := fw.NewTcpOutput(e.cfg.Host, e.cfg.Port, e.cfg.Index)
+	p, err := fw.NewPipeline(splunkapi.PipelineConfig{
+		OutputsConf: buildOutputsConf(e.cfg),
+	})
 	if err != nil {
 		return fmt.Errorf("splunktcpoutexporter: %w", err)
 	}
+	if err := p.Start(); err != nil {
+		p.Destroy()
+		return fmt.Errorf("splunktcpoutexporter: %w", err)
+	}
 
-	e.out = out
+	e.pipeline = p
 	e.logger.Info("splunktcpout exporter started",
 		zap.String("host", e.cfg.Host),
 		zap.Int("port", e.cfg.Port),
@@ -75,14 +91,15 @@ func (e *splunktcpoutExporter) start(_ context.Context, host component.Host) err
 	return nil
 }
 
-// shutdown drains the send queue and closes the S2S connection.
+// shutdown drains the send queue and destroys the pipeline.
 func (e *splunktcpoutExporter) shutdown(_ context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.out != nil {
-		e.out.Destroy(e.cfg.DrainSeconds)
-		e.out = nil
+	if e.pipeline != nil {
+		e.pipeline.Stop(e.cfg.DrainSeconds)
+		e.pipeline.Destroy()
+		e.pipeline = nil
 		e.logger.Info("splunktcpout exporter shut down")
 	}
 	return nil
@@ -93,7 +110,7 @@ func (e *splunktcpoutExporter) pushLogsData(_ context.Context, ld plog.Logs) err
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.out == nil {
+	if e.pipeline == nil {
 		return errors.New("splunktcpout: exporter not started")
 	}
 
@@ -129,7 +146,7 @@ func (e *splunktcpoutExporter) sendLogRecord(lr plog.LogRecord, defaultHost stri
 	hostField := logAttr(lr, "host.name", defaultHost)
 	index := logAttr(lr, "splunk.index", e.cfg.Index)
 
-	return e.out.Send([]byte(raw), source, sourcetype, hostField, index)
+	return e.pipeline.Send([]byte(raw), source, sourcetype, hostField, index)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -155,4 +172,5 @@ func resourceAttr(r pcommon.Resource, key, fallback string) string {
 	}
 	return fallback
 }
+
 
