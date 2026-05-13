@@ -1,0 +1,84 @@
+# File log → chunkedlb → debug pipeline.
+#
+# Use this config to drive the chunkedlb processor with input from real log
+# files.  Tail any file (or set of files) by changing `include` below.
+#
+# Note: the filelog receiver assigns a sourcetype-equivalent attribute via
+# `attributes.com.splunk.sourcetype` so chunkedlb's `sourcetype_attribute`
+# lookup picks the right Rule.  The default-pattern fast path (plan §6.0)
+# kicks in when EVENT_BREAKER is "([\\r\\n]+)" or empty.
+#
+# Run:
+#   ./bin/otelcol-perf-processor --config file:internal/processor/chunkedlbprocessor/testdata/collector_filelog_chunkedlb.yaml
+
+receivers:
+  filelog:
+    include:
+      - /var/log/example/*.log
+      # Add additional file globs here.
+    start_at: beginning
+    # Tag every record with a sourcetype the chunkedlb processor recognizes.
+    # Override per-glob or per-content via routing operators if needed.
+    attributes:
+      com.splunk.sourcetype: access_combined
+
+  otlp:
+    protocols:
+      grpc: {}
+      http: {}
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 512
+
+  chunkedlb:
+    sourcetype_attribute: "com.splunk.sourcetype"
+    done_key_attribute:   "com.splunk.done_key"
+    # done_key_emission: never (default) — no OTel-contrib exporter today
+    # interprets the doneKey marker; emitting it produces phantom empty
+    # records downstream.  Flip to "always" only when wiring up a future
+    # marker-aware Splunk exporter.  See design doc §6.0.4.
+    done_key_emission:    "never"
+    cpu_profiling:        false
+    httpout_compat:       false
+    max_cached_rules:     10000
+
+    default_rule:
+      event_breaker_enable: false
+      event_breaker:        "([\\r\\n]+)"
+
+    rules:
+      access_combined:
+        # Default pattern → pure-Go bytes.IndexByte fast path on the hybrid
+        # dispatcher (plan §6.0).  Zero cgo crossings on the hot path.
+        event_breaker_enable: true
+        event_breaker:        "([\\r\\n]+)"
+
+      multiline_app:
+        # Custom multiline regex → cgo + PCRE2-JIT slow path.
+        event_breaker_enable: true
+        event_breaker:        "(\\n)(?=\\d{4}-\\d{2}-\\d{2})"
+
+    regex:
+      match_limit:        1000000
+      depth_limit:        1000
+      timeout_ms:         50
+      max_pattern_bytes:  4096
+
+  batch:
+    send_batch_size: 200
+    timeout: 5s
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs:
+      receivers:  [filelog, otlp]
+      # chunkedlb upstream of batch so firstHalf/done/tail enter together
+      # (plan §9.2).
+      processors: [memory_limiter, chunkedlb, batch]
+      exporters:  [debug]

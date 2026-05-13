@@ -1,0 +1,68 @@
+# Example collector configuration that exercises the chunkedlb processor.
+# Mirrors the per-sourcetype EVENT_BREAKER / EVENT_BREAKER_ENABLE semantics
+# from props.conf (develop/splunk-10.4 cfg/bundles/README/props.conf.spec.in).
+#
+# Phase 1 ships the processor as a pass-through skeleton; this config is here
+# so the wiring can be exercised on the Windows build today and the same file
+# is used for §8 conformance tests once the dispatcher lands.
+
+receivers:
+  otlp:
+    protocols:
+      grpc: {}
+      http: {}
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 512
+
+  # The chunkedlb processor.
+  # In the hybrid dispatcher (plan §6.0):
+  #   - "([\\r\\n]+)" / "[\\r\\n]+" / "(\\r\\n|\\n)" / "" all take the
+  #     pure-Go bytes.IndexByte fast path (zero cgo crossings, ~5 GB/s/core).
+  #   - Anything else compiles via PCRE2-JIT (cgo) at first sight of the
+  #     sourcetype and runs there for the slow path.
+  chunkedlb:
+    sourcetype_attribute: "com.splunk.sourcetype"
+    done_key_attribute:   "com.splunk.done_key"
+    cpu_profiling:        false
+    httpout_compat:       false
+    max_cached_rules:     10000
+
+    default_rule:
+      event_breaker_enable: false
+      event_breaker:        "([\\r\\n]+)"
+
+    rules:
+      access_combined:
+        event_breaker_enable: true
+        event_breaker:        "([\\r\\n]+)"
+
+      multiline_app:
+        event_breaker_enable: true
+        # Custom multiline pattern — exercised by the cgo+PCRE2 slow path.
+        event_breaker:        "(\\n)(?=\\d{4}-\\d{2}-\\d{2})"
+
+    regex:
+      match_limit:        1000000
+      depth_limit:        1000
+      timeout_ms:         50
+      max_pattern_bytes:  4096
+
+  batch:
+    send_batch_size: 200
+    timeout: 5s
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs:
+      receivers:  [otlp]
+      # chunkedlb runs UPSTREAM of the batch processor so the
+      # firstHalf / done / tail trio enters batch together (plan §9.2).
+      processors: [memory_limiter, chunkedlb, batch]
+      exporters:  [debug]
