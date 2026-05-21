@@ -1,9 +1,23 @@
-# Unified runtime config: splunktailreceiver → splunktcpoutexporter (single process)
+# Unified e2e runtime config: splunktailreceiver → splunktcpoutexporter
 #
 # Run:
 #   LD_LIBRARY_PATH=/home/chli/main/src/framework_cabi:/home/chli/splunk_home/lib \
 #   SPLUNK_HOME=/home/chli/splunk_home \
 #   ./bin-unified/splunk-col --config config-unified.yaml
+#
+# Tail inputs are read from splunkframeworkextension's inputs.conf cache.
+# Example stanza:
+#   [monitor:///tmp/e2e_fresh_*.log]
+#   disabled = 0
+#   sourcetype = tailin_e2e
+#   index = main
+#
+# Tcp output is read from splunkframeworkextension's outputs.conf cache.
+# Example stanza:
+#   [tcpout]
+#   defaultGroup = primary_indexers
+#   [tcpout:primary_indexers]
+#   server = indexer.example.com:9997
 
 extensions:
   splunkframework:
@@ -12,27 +26,16 @@ extensions:
 receivers:
   splunktail:
     framework: splunkframework
-    splunk_home: /home/chli/splunk_home
-    default_sourcetype: tailin_e2e
-    default_index: main
-    monitors:
-      - glob: /tmp/e2e_fresh_*.log
-        sourcetype: tailin_e2e
 
 exporters:
   splunktcpout:
     framework: splunkframework
-    host: 10.236.40.125
-    port: 9997
+    output_group: primary_indexers
     index: main
     default_source: /tmp/e2e_fresh_*.log
     default_sourcetype: tailin_e2e
     default_host: ufcompo
     drain_seconds: 5
-    splunk_home: /home/chli/splunk_home
-
-  debug:
-    verbosity: detailed
 
 service:
   extensions: [splunkframework]
@@ -46,4 +49,4 @@ service:
   pipelines:
     logs:
       receivers: [splunktail]
-      exporters: [splunktcpout, debug]
+      exporters: [splunktcpout]

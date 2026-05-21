@@ -24,9 +24,7 @@ func NewFactory() receiver.Factory {
 
 func createDefaultConfig() component.Config {
 	return &Config{
-		Framework:         component.NewID(component.MustNewType("splunkframework")),
-		DefaultSourcetype: "tailin",
-		DefaultIndex:      "main",
+		Framework: component.NewID(component.MustNewType("splunkframework")),
 	}
 }
 

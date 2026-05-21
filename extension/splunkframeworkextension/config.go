@@ -14,4 +14,10 @@ type Config struct {
 	// Sets $SPLUNK_DB for the C++ framework (fishbucket lives here).
 	// Defaults to $SPLUNK_HOME/var/lib/splunk when empty.
 	SplunkDB string `mapstructure:"splunk_db"`
+
+	// ManagementPort starts the native Splunk REST management server when set.
+	// The supported REST surface is auth/login plus services/configs/conf-*.
+	// Leave as zero to disable the listener while keeping the in-process
+	// ConfManager cache/API enabled.
+	ManagementPort int `mapstructure:"management_port"`
 }

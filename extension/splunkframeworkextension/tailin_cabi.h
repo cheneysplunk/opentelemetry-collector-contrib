@@ -134,9 +134,11 @@ TailinHandle* tailin_create(tailin_event_cb    cb,
                              const TailinConfig* cfg);
 
 /**
- * tailin_add_monitor() — register a glob pattern to watch.
+ * tailin_add_monitor() — register a programmatic glob pattern to watch.
  *
  * Must be called after tailin_create() and before tailin_start().
+ * Optional: callers may skip this entirely when they want TailManager to use
+ * the merged inputs.conf cache loaded from SPLUNK_HOME.
  * Writes an in-memory inputs.conf stanza:
  *   [monitor://<glob>]
  *   sourcetype = <sourcetype>
@@ -159,8 +161,9 @@ int tailin_add_monitor(TailinHandle* handle,
 /**
  * tailin_start() — start the TailManager, TailReader, and parsing pipeline.
  *
- * Must be called exactly once after tailin_create() and all
- * tailin_add_monitor() calls.
+ * Must be called exactly once after tailin_create() and any
+ * tailin_add_monitor() calls. If no monitors were added programmatically,
+ * the native TailManager reads the already-loaded merged inputs.conf cache.
  *
  * @return  0 on success, -1 on error (see tailin_last_error()).
  */

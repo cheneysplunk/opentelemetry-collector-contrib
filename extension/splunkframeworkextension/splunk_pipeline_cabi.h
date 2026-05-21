@@ -61,6 +61,7 @@
 #define SPLUNK_PIPELINE_CABI_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
 
 #ifdef __cplusplus
@@ -92,6 +93,27 @@ typedef void (*splunk_event_cb)(
 );
 
 /**
+ * splunk_bytes_cb — raw-bytes variant of splunk_event_cb.
+ *
+ * The @p data pointer is typed as const uint8_t* to make clear that the
+ * buffer is an opaque byte slice of length @p len with no guaranteed NUL
+ * terminator.  This avoids the internal NUL-termination copy incurred by
+ * splunk_event_cb, making it the preferred callback for callers that treat
+ * event data as []byte (e.g. Go via C.GoBytes).
+ *
+ * Use splunk_pipeline_create_bytes() to register this callback type.
+ */
+typedef void (*splunk_bytes_cb)(
+    const uint8_t* data,
+    size_t         len,
+    const char*    source,
+    const char*    sourcetype,
+    const char*    host,
+    time_t         event_time,
+    void*          userdata
+);
+
+/**
  * splunk_pipeline_create() — create a pipeline from raw conf stanza text.
  *
  * All stanza arguments accept the same syntax as the corresponding
@@ -120,6 +142,36 @@ SplunkPipeline* splunk_pipeline_create(
 );
 
 /**
+ * splunk_pipeline_create_bytes() — raw-bytes variant of splunk_pipeline_create().
+ *
+ * Identical to splunk_pipeline_create() but registers a splunk_bytes_cb.
+ * Event bytes are passed directly without a NUL-termination copy, making
+ * this the preferred path for Go callers that use C.GoBytes().
+ */
+SplunkPipeline* splunk_pipeline_create_bytes(
+    const char*    inputs_conf,
+    const char*    outputs_conf,
+    const char*    props_conf,
+    splunk_bytes_cb cb,
+    void*          userdata
+);
+
+/**
+ * splunk_pipeline_create_output_group() — create an output pipeline from an
+ * existing outputs.conf tcpout group.
+ *
+ * Does not inject or write outputs.conf. The native TcpOutputGroups code reads
+ * the already-loaded merged outputs.conf cache.
+ *
+ * @param output_group Bare tcpout group name, e.g. "prod" for [tcpout:prod].
+ * @param default_index Default Splunk index name, or NULL to leave unset.
+ */
+SplunkPipeline* splunk_pipeline_create_output_group(
+    const char* output_group,
+    const char* default_index
+);
+
+/**
  * splunk_pipeline_start() — start all inputs and outputs.
  *
  * For input pipelines, events begin arriving via the callback immediately.
@@ -145,6 +197,23 @@ int splunk_pipeline_start(SplunkPipeline* p);
  */
 int splunk_pipeline_send(
     SplunkPipeline* p,
+    const char*     data,
+    size_t          len,
+    const char*     source,
+    const char*     sourcetype,
+    const char*     host,
+    const char*     index
+);
+
+/**
+ * splunk_pipeline_send_to_group() — send one event to a specific tcpout group.
+ *
+ * Sets Splunk's _TCP_ROUTING metadata to @p output_group. Pass NULL/"" to use
+ * the pipeline's default output group or outputs.conf defaultGroup.
+ */
+int splunk_pipeline_send_to_group(
+    SplunkPipeline* p,
+    const char*     output_group,
     const char*     data,
     size_t          len,
     const char*     source,

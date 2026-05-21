@@ -21,10 +21,17 @@ package splunkframeworkextension // import "github.com/open-telemetry/openteleme
 #include "splunkfw_cabi.h"
 #include "splunk_pipeline_cabi.h"
 #include <stdlib.h>
+#include <stdint.h>
 
 // Forward declaration for the Go-exported event callback.
 // CGo //export drops 'const', so use non-const char* here.
 extern void goPipelineEventCallback(char* data, size_t len,
+                                    char* source, char* sourcetype,
+                                    char* host, time_t event_time,
+                                    void* userdata);
+
+// Forward declaration for the raw-bytes callback (uint8_t* data).
+extern void goPipelineBytesCallback(uint8_t* data, size_t len,
                                     char* source, char* sourcetype,
                                     char* host, time_t event_time,
                                     void* userdata);
@@ -52,7 +59,7 @@ import (
 // looks up the channel by ID and sends the event — no Go pointer passed to C.
 
 var (
-	pipelineNextID  atomic.Int32
+	pipelineNextID   atomic.Int32
 	pipelineRegistry sync.Map // int32 → chan splunkapi.Event
 )
 
@@ -89,11 +96,45 @@ func goPipelineEventCallback(
 	}
 }
 
+//export goPipelineBytesCallback
+func goPipelineBytesCallback(
+	data *C.uint8_t, dataLen C.size_t,
+	source *C.char, sourcetype *C.char,
+	host *C.char, eventTime C.time_t,
+	userdata unsafe.Pointer,
+) {
+	id := int32(uintptr(userdata))
+	v, ok := pipelineRegistry.Load(id)
+	if !ok {
+		return
+	}
+	ch := v.(chan splunkapi.Event)
+
+	if dataLen == 0 {
+		return // sentinel flush event — skip
+	}
+	ev := splunkapi.Event{
+		RawBody:    C.GoBytes(unsafe.Pointer(data), C.int(dataLen)),
+		Source:     C.GoString(source),
+		Sourcetype: C.GoString(sourcetype),
+		Host:       C.GoString(host),
+		Time:       time.Unix(int64(eventTime), 0),
+	}
+	select {
+	case ch <- ev:
+	default:
+	}
+}
+
 // ── splunkFrameworkExtension ──────────────────────────────────────────────────
 
 type splunkFrameworkExtension struct {
-	cfg    *Config
-	logger *zap.Logger
+	cfg           *Config
+	logger        *zap.Logger
+	confMu        sync.Mutex
+	confMgr       *cConfManager
+	monitorMu     sync.Mutex
+	monitorActive bool
 }
 
 func newSplunkFrameworkExtension(set extension.Settings, cfg *Config) *splunkFrameworkExtension {
@@ -103,6 +144,9 @@ func newSplunkFrameworkExtension(set extension.Settings, cfg *Config) *splunkFra
 func (e *splunkFrameworkExtension) Start(_ context.Context, _ component.Host) error {
 	if e.cfg.SplunkHome == "" {
 		return fmt.Errorf("splunkframeworkextension: splunk_home must not be empty")
+	}
+	if e.cfg.ManagementPort < 0 || e.cfg.ManagementPort > 65535 {
+		return fmt.Errorf("splunkframeworkextension: management_port must be between 0 and 65535")
 	}
 	cHome := C.CString(e.cfg.SplunkHome)
 	defer C.free(unsafe.Pointer(cHome))
@@ -117,11 +161,50 @@ func (e *splunkFrameworkExtension) Start(_ context.Context, _ component.Host) er
 		return fmt.Errorf("splunkframeworkextension: splunkfw_init failed: %s",
 			C.GoString(C.splunkfw_last_error()))
 	}
-	e.logger.Info("Splunk framework initialised", zap.String("splunk_home", e.cfg.SplunkHome))
+
+	e.confMu.Lock()
+	confMgr := e.confMgr
+	if confMgr == nil {
+		var err error
+		confMgr, err = newCConfManager(e.cfg.SplunkHome)
+		if err != nil {
+			e.confMu.Unlock()
+			C.splunkfw_shutdown()
+			return fmt.Errorf("splunkframeworkextension: conf manager init failed: %w", err)
+		}
+		e.confMgr = confMgr
+	}
+	if e.cfg.ManagementPort > 0 {
+		if err := confMgr.StartREST(e.cfg.ManagementPort); err != nil {
+			e.confMgr = nil
+			e.confMu.Unlock()
+			confMgr.Close()
+			C.splunkfw_shutdown()
+			return fmt.Errorf("splunkframeworkextension: REST server init failed: %w", err)
+		}
+	}
+	e.confMu.Unlock()
+
+	fields := []zap.Field{
+		zap.String("splunk_home", e.cfg.SplunkHome),
+		zap.Bool("conf_cache_loaded", true),
+	}
+	if e.cfg.ManagementPort > 0 {
+		fields = append(fields, zap.Int("management_port", e.cfg.ManagementPort))
+	}
+	e.logger.Info("Splunk framework initialised", fields...)
 	return nil
 }
 
 func (e *splunkFrameworkExtension) Shutdown(_ context.Context) error {
+	e.confMu.Lock()
+	confMgr := e.confMgr
+	e.confMgr = nil
+	e.confMu.Unlock()
+	if confMgr != nil {
+		confMgr.Close()
+	}
+
 	C.splunkfw_shutdown()
 	e.logger.Info("Splunk framework shut down")
 	return nil
@@ -150,18 +233,18 @@ func (e *splunkFrameworkExtension) NewPipeline(cfg splunkapi.PipelineConfig) (sp
 	// Allocate event channel and registry slot only for input pipelines.
 	var id int32
 	var ch chan splunkapi.Event
-	var cb C.splunk_event_cb
+	var cb C.splunk_bytes_cb
 	var udPtr unsafe.Pointer
-
 	if cfg.InputsConf != "" {
 		id = pipelineNextID.Add(1)
 		ch = make(chan splunkapi.Event, 1024)
 		pipelineRegistry.Store(id, ch)
-		cb = C.splunk_event_cb(C.goPipelineEventCallback)
-		udPtr = unsafe.Pointer(uintptr(id))
+		cb = C.splunk_bytes_cb(C.goPipelineBytesCallback)
+		idWord := uintptr(id)
+		udPtr = *(*unsafe.Pointer)(unsafe.Pointer(&idWord))
 	}
 
-	handle := C.splunk_pipeline_create(cInputs, cOutputs, cProps, cb, udPtr)
+	handle := C.splunk_pipeline_create_bytes(cInputs, cOutputs, cProps, cb, udPtr)
 	if handle == nil {
 		if ch != nil {
 			pipelineRegistry.Delete(id)
@@ -172,6 +255,31 @@ func (e *splunkFrameworkExtension) NewPipeline(cfg splunkapi.PipelineConfig) (sp
 	}
 
 	return &cPipeline{handle: handle, id: id, ch: ch}, nil
+}
+
+// NewOutputPipeline creates a tcpout pipeline from an existing outputs.conf
+// group. The native C++ layer reads the merged outputs.conf cache; Go only
+// passes the bare group name through the CABI.
+func (e *splunkFrameworkExtension) NewOutputPipeline(outputGroup, defaultIndex string) (splunkapi.Pipeline, error) {
+	if outputGroup == "" {
+		return nil, fmt.Errorf("splunkframeworkextension: output_group must not be empty")
+	}
+
+	cGroup := C.CString(outputGroup)
+	defer C.free(unsafe.Pointer(cGroup))
+
+	var cIndex *C.char
+	if defaultIndex != "" {
+		cIndex = C.CString(defaultIndex)
+		defer C.free(unsafe.Pointer(cIndex))
+	}
+
+	handle := C.splunk_pipeline_create_output_group(cGroup, cIndex)
+	if handle == nil {
+		return nil, fmt.Errorf("splunk_pipeline_create_output_group failed: %s",
+			C.GoString(C.splunk_pipeline_last_error()))
+	}
+	return &cPipeline{handle: handle}, nil
 }
 
 // ── cPipeline ─────────────────────────────────────────────────────────────────
@@ -200,6 +308,10 @@ func (p *cPipeline) Events() <-chan splunkapi.Event {
 }
 
 func (p *cPipeline) Send(body []byte, source, sourcetype, host, index string) error {
+	return p.SendToGroup(body, source, sourcetype, host, index, "")
+}
+
+func (p *cPipeline) SendToGroup(body []byte, source, sourcetype, host, index, outputGroup string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -222,11 +334,18 @@ func (p *cPipeline) Send(body []byte, source, sourcetype, host, index string) er
 		defer C.free(unsafe.Pointer(cIndex))
 	}
 
-	rc := C.splunk_pipeline_send(p.handle,
+	var cGroup *C.char
+	if outputGroup != "" {
+		cGroup = C.CString(outputGroup)
+		defer C.free(unsafe.Pointer(cGroup))
+	}
+
+	rc := C.splunk_pipeline_send_to_group(p.handle,
+		cGroup,
 		cData, C.size_t(len(body)),
 		cSource, cSourcetype, cHost, cIndex)
 	if rc != 0 {
-		return fmt.Errorf("splunk_pipeline_send: %s",
+		return fmt.Errorf("splunk_pipeline_send_to_group: %s",
 			C.GoString(C.splunk_pipeline_last_error()))
 	}
 	return nil
@@ -253,5 +372,3 @@ func (p *cPipeline) Destroy() {
 	C.splunk_pipeline_destroy(p.handle)
 	p.handle = nil
 }
-
-

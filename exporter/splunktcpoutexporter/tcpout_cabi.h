@@ -6,7 +6,7 @@
  *
  * Usage (C / C++):
  *   #include "tcpout_cabi.h"
- *   TcpoutHandle* h = tcpout_create("10.0.0.5", 9997, NULL);
+ *   TcpoutHandle* h = tcpout_create_group("prod", NULL);
  *   tcpout_send(h, "hello world", 11, NULL, NULL, NULL, NULL);
  *   tcpout_destroy(h, 3);
  *
@@ -14,7 +14,7 @@
  *   // #cgo LDFLAGS: -L. -ltcpout_cabi -lstdc++ -ldl
  *   // #include "tcpout_cabi.h"
  *   import "C"
- *   h := C.tcpout_create(host, port, nil)
+ *   h := C.tcpout_create_group(group, nil)
  *   C.tcpout_send(h, data, length, nil, nil, nil, nil)
  *   C.tcpout_destroy(h, 3)
  */
@@ -46,6 +46,23 @@ typedef struct TcpoutHandle TcpoutHandle;
 TcpoutHandle* tcpout_create(const char* host, int port, const char* index);
 
 /**
+ * tcpout_create_group() — initialise TCP output from an existing outputs.conf
+ * group.
+ *
+ * Does not write any in-memory outputs.conf. The native TcpOutputGroups
+ * implementation reads the already-loaded merged outputs.conf cache and sends
+ * through @p output_group by stamping _TCP_ROUTING on each event.
+ *
+ * @param output_group Bare tcpout group name, e.g. "prod" for [tcpout:prod].
+ * @param index        Default Splunk index name, or NULL to leave unset.
+ *
+ * @return  Opaque handle on success, NULL on failure.
+ *          Call tcpout_last_error() for a human-readable reason.
+ */
+TcpoutHandle* tcpout_create_group(const char* output_group,
+                                  const char* index);
+
+/**
  * tcpout_send() — send one raw event.
  *
  * All metadata fields are optional; pass NULL to omit.
@@ -69,6 +86,23 @@ int tcpout_send(TcpoutHandle* handle,
                 const char*   sourcetype,
                 const char*   host_field,
                 const char*   index);
+
+/**
+ * tcpout_send_to_group() — send one raw event to a specific tcpout group.
+ *
+ * Sets Splunk's _TCP_ROUTING metadata before enqueueing the event.
+ * @param output_group Bare tcpout group name. NULL/"" uses the handle's
+ *                     default output group, or outputs.conf defaultGroup if
+ *                     the handle has no default group.
+ */
+int tcpout_send_to_group(TcpoutHandle* handle,
+                         const char*   output_group,
+                         const char*   data,
+                         size_t        len,
+                         const char*   source,
+                         const char*   sourcetype,
+                         const char*   host_field,
+                         const char*   index);
 
 /**
  * tcpout_destroy() — flush queued events and shut down.

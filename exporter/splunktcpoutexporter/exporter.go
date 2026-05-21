@@ -47,17 +47,6 @@ func newLogsExporter(ctx context.Context, params exporter.Settings, cfg *Config)
 	)
 }
 
-// buildOutputsConf converts structured exporter config into a raw outputs.conf
-// stanza string understood by splunk_pipeline_create().
-func buildOutputsConf(cfg *Config) string {
-	s := fmt.Sprintf("[tcpout]\ndefaultGroup = cabi\n[tcpout:cabi]\nserver = %s:%d\n",
-		cfg.Host, cfg.Port)
-	if cfg.Index != "" {
-		s += "index = " + cfg.Index + "\n"
-	}
-	return s
-}
-
 // start locates splunkframeworkextension and opens the S2S pipeline.
 func (e *splunktcpoutExporter) start(_ context.Context, host component.Host) error {
 	var fw splunkapi.SplunkFramework
@@ -69,9 +58,11 @@ func (e *splunktcpoutExporter) start(_ context.Context, host component.Host) err
 		return fmt.Errorf("splunktcpoutexporter: extension %q does not implement splunkapi.SplunkFramework", e.cfg.Framework)
 	}
 
-	p, err := fw.NewPipeline(splunkapi.PipelineConfig{
-		OutputsConf: buildOutputsConf(e.cfg),
-	})
+	if e.cfg.Host != "" || e.cfg.Port != 0 || e.cfg.SplunkHome != "" {
+		e.logger.Warn("legacy splunktcpoutexporter destination config is ignored; configure server addresses in outputs.conf and set splunk_home on splunkframeworkextension")
+	}
+
+	p, err := fw.NewOutputPipeline(e.cfg.OutputGroup, e.cfg.Index)
 	if err != nil {
 		return fmt.Errorf("splunktcpoutexporter: %w", err)
 	}
@@ -82,8 +73,7 @@ func (e *splunktcpoutExporter) start(_ context.Context, host component.Host) err
 
 	e.pipeline = p
 	e.logger.Info("splunktcpout exporter started",
-		zap.String("host", e.cfg.Host),
-		zap.Int("port", e.cfg.Port),
+		zap.String("output_group", e.cfg.OutputGroup),
 		zap.String("index", e.cfg.Index),
 	)
 	return nil
@@ -137,24 +127,37 @@ func (e *splunktcpoutExporter) pushLogsData(_ context.Context, ld plog.Logs) err
 //	sourcetype  → log attr "splunk.sourcetype"   → Config.DefaultSourcetype
 //	host        → log attr "host.name"           → resource "host.name" → Config.DefaultHost
 //	index       → log attr "splunk.index"        → Config.Index (may be empty)
+//	outputGroup → log attr "splunk.tcpout_group" → Config.OutputGroup
 func (e *splunktcpoutExporter) sendLogRecord(lr plog.LogRecord, defaultHost string) error {
-	raw := logBody(lr)
+	raw := logBodyBytes(lr)
 	source := logAttr(lr, "splunk.source", e.cfg.DefaultSource)
 	sourcetype := logAttr(lr, "splunk.sourcetype", e.cfg.DefaultSourcetype)
 	hostField := logAttr(lr, "host.name", defaultHost)
 	index := logAttr(lr, "splunk.index", e.cfg.Index)
+	outputGroup := logAttr(lr, "splunk.tcpout_group", e.cfg.OutputGroup)
 
-	return e.pipeline.Send([]byte(raw), source, sourcetype, hostField, index)
+	return e.pipeline.SendToGroup(raw, source, sourcetype, hostField, index, outputGroup)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-func logBody(lr plog.LogRecord) string {
+// logBodyBytes returns the log record body as raw bytes.
+//
+//   - ValueTypeBytes → zero-copy slice from the pdata buffer (raw chunk from
+//     splunktailreceiver, exactly what tcpout sends on the wire)
+//   - ValueTypeStr   → string converted to bytes (no extra allocation in the
+//     common case because Send copies anyway)
+//   - anything else  → AsString() text representation as bytes
+func logBodyBytes(lr plog.LogRecord) []byte {
 	b := lr.Body()
-	if b.Type() == pcommon.ValueTypeStr {
-		return b.Str()
+	switch b.Type() {
+	case pcommon.ValueTypeBytes:
+		return b.Bytes().AsRaw()
+	case pcommon.ValueTypeStr:
+		return []byte(b.Str())
+	default:
+		return []byte(b.AsString())
 	}
-	return b.AsString()
 }
 
 func logAttr(lr plog.LogRecord, key, fallback string) string {
@@ -170,5 +173,3 @@ func resourceAttr(r pcommon.Resource, key, fallback string) string {
 	}
 	return fallback
 }
-
-

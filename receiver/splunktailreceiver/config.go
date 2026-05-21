@@ -4,13 +4,14 @@
 package splunktailreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunktailreceiver"
 
 import (
-	"errors"
 	"fmt"
 
 	"go.opentelemetry.io/collector/component"
 )
 
-// MonitorConfig describes a single file-glob to watch.
+// MonitorConfig is a legacy receiver-side monitor declaration.
+// It is accepted for config compatibility but ignored. Create monitor://
+// stanzas in the extension-owned inputs.conf instead.
 type MonitorConfig struct {
 	// Glob is a shell-style glob pattern or exact file path. Required.
 	Glob string `mapstructure:"glob"`
@@ -34,28 +35,27 @@ type Config struct {
 	// Defaults to "splunkframework". Must be listed in service.extensions.
 	Framework component.ID `mapstructure:"framework"`
 
-	// Monitors is the list of file globs to watch. At least one is required.
+	// Monitors is deprecated and ignored. The receiver now reads from the
+	// splunkframeworkextension-owned inputs.conf cache.
 	Monitors []MonitorConfig `mapstructure:"monitors"`
 
-	// DefaultSourcetype is the Splunk sourcetype used for monitors that do not
-	// specify their own sourcetype. Default: "tailin".
+	// DefaultSourcetype is deprecated and ignored. Configure sourcetype in
+	// inputs.conf monitor:// stanzas.
 	DefaultSourcetype string `mapstructure:"default_sourcetype"`
 
-	// DefaultIndex is the Splunk index used for monitors that do not specify
-	// their own index. Default: "main".
+	// DefaultIndex is deprecated and ignored. Configure index in inputs.conf.
 	DefaultIndex string `mapstructure:"default_index"`
 
-	// Host is the host field written to every log record. Defaults to the
-	// system hostname (gethostname).
+	// Host is deprecated and ignored. Configure host in inputs.conf or through
+	// the native Splunk defaults.
 	Host string `mapstructure:"host"`
 
-	// FishbucketDir is the path to a writable directory for fish-bucket state
-	// files (file-position persistence). Empty → $SPLUNK_DB/fishbucket.
+	// FishbucketDir is deprecated and ignored. The extension-owned Splunk
+	// framework uses the native fishbucket location from SPLUNK_DB.
 	FishbucketDir string `mapstructure:"fishbucket_dir"`
 
-	// SplunkHome, when non-empty, is written to the SPLUNK_HOME environment
-	// variable before the C library is initialised. It must point to a Splunk
-	// installation directory containing an etc/ sub-tree.
+	// SplunkHome is deprecated and ignored. Set splunk_home on the
+	// splunkframeworkextension instead.
 	SplunkHome string `mapstructure:"splunk_home"`
 }
 
@@ -63,14 +63,6 @@ type Config struct {
 func (c *Config) Validate() error {
 	if c.Framework == (component.ID{}) {
 		return fmt.Errorf("splunktailreceiver: framework must not be empty; set it to the extension id (e.g. splunkframework)")
-	}
-	if len(c.Monitors) == 0 {
-		return errors.New("splunktailreceiver: at least one monitor must be configured")
-	}
-	for i, m := range c.Monitors {
-		if m.Glob == "" {
-			return fmt.Errorf("splunktailreceiver: monitors[%d].glob must not be empty", i)
-		}
 	}
 	return nil
 }

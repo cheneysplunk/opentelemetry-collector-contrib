@@ -1,54 +1,65 @@
 # splunktcpoutexporter — Splunk S2S TCP Output Exporter
 
 An OpenTelemetry Collector exporter that forwards log records to a Splunk indexer
-over the native **S2S (cooked-stream) protocol**, using `libtcpout_cabi.so` — the
-standalone C-ABI shared library extracted from Splunk's `tcpout` subsystem.
+over the native **S2S (cooked-stream) protocol**, using `libsplunk_cabi.so` — the
+unified C-ABI shared library containing the Splunk framework, tailin, and tcpout.
 
-> **Platform:** Linux only (CGo + `libtcpout_cabi.so` required).
+> **Platform:** Linux only (CGo + `libsplunk_cabi.so` required).
+
+**Input body type:** accepts both `ValueTypeBytes` (raw chunks from `splunktailreceiver`,
+zero-copy) and `ValueTypeStr` (one string per record, e.g. from `filelogreceiver`).
+Converted to `[]byte` via `logBodyBytes()` before passing to `splunk_pipeline_send()`.
 
 ---
 
 ## Architecture
 
 ```
-mock.log (tailed by filelog receiver)
-        │  plog.Logs — each line = one log record
-        │  attributes: splunk.sourcetype, splunk.source
-        │  resource:   host.name
+File(s) on disk  (inotify / poll)
+        │
+        ▼
+libsplunk_cabi.so  — tailin side
+  WatchedTailFile::readChunk()
+    → raw chunk (~64 KB, may span many lines)
+    → stamps source / sourcetype / host / index
+        │  tailinGoCallback (CGo trampoline)
+        ▼
+plog.LogRecord
+  Body:        ValueTypeBytes  ← raw chunk, set via SetEmptyBytes().FromRaw()
+  Attributes:  splunk.source / splunk.sourcetype
+  Resource:    host.name
+        │
+        │  — or, from any other receiver —
+        │
+  Body:        ValueTypeStr    ← e.g. from filelogreceiver (one line per record)
+        │
         ▼
 OTel Collector pipeline
         ▼
 splunktcpoutexporter  (exporter.go)
-        │  CGo call per log record
+  logBodyBytes():
+    ValueTypeBytes → b.Bytes().AsRaw()   (zero-copy)
+    ValueTypeStr   → []byte(b.Str())
+        │  splunk_pipeline_send_to_group(data, len, output_group, ...)
         ▼
-libtcpout_cabi.so     (tcpout_cabi.h / tcpout_cabi.cpp)
-  extern "C" boundary
-        │  statically linked
-        ▼
-libtcpout.a + libsupport.a
-  → S2S cooked-stream over TCP → Splunk indexer :9997  index=main
+libsplunk_cabi.so  — tcpout side
+  reads outputs.conf [tcpout:<output_group>]
+  → S2S cooked-stream over TCP → Splunk indexer(s)  index=main
 ```
 
 ---
 
 ## Prerequisites
 
-### 1. Build `libtcpout_cabi.so`
+### Build `libsplunk_cabi.so`
 
 ```bash
-cd /home/chli/main/src/output/tcpout_lib
-
-# First-time: build ~950 framework objects (parallelise; takes a few minutes)
-make -j8 libsupport.a
-
-# Build the 17 tcpout objects
-make lib
-
-# Build the C-ABI shared library (libtcpout_cabi.so ~1.1 GB)
-make cabi
+cd /home/chli/main/src/framework_cabi
+make -j$(nproc)
+# → libsplunk_cabi.so (~674 MB, contains framework + tailin + tcpout)
 ```
 
-### 2. One-time `libbz2` symlink fix
+### One-time `libbz2` symlink fix
 
 `libarchive.so` in `splunk_home/lib` links against `libbz2` but only `libbz2.so.1`
 exists on the system (no `-dev` package installed):
@@ -62,25 +73,25 @@ ln -s /usr/lib/x86_64-linux-gnu/libbz2.so.1 /home/chli/splunk_home/lib/libbz2.so
 ## Build the exporter package
 
 ```bash
-export TCPOUT_LIB=/home/chli/main/src/output/tcpout_lib
+export FW_DIR=/home/chli/main/src/framework_cabi
 export SPLUNK_HOME_LIB=/home/chli/splunk_home/lib
 
 cd /home/chli/otel/opentelemetry-collector-contrib/exporter/splunktcpoutexporter
 
-CGO_CFLAGS="-I${TCPOUT_LIB}" \
-CGO_LDFLAGS="-L${TCPOUT_LIB} -L${SPLUNK_HOME_LIB} \
-             -Wl,-rpath,${TCPOUT_LIB} \
-             -Wl,-rpath,${SPLUNK_HOME_LIB}" \
+CGO_LDFLAGS="-L${FW_DIR} -lsplunk_cabi \
+             -Wl,-rpath,${FW_DIR} \
+             -Wl,-rpath,${SPLUNK_HOME_LIB} \
+             -lstdc++ -ldl -lpthread" \
 go build ./...
 ```
 
 To verify without linking an executable:
 
 ```bash
-CGO_CFLAGS="-I${TCPOUT_LIB}" \
-CGO_LDFLAGS="-L${TCPOUT_LIB} -L${SPLUNK_HOME_LIB} \
-             -Wl,-rpath,${TCPOUT_LIB} \
-             -Wl,-rpath,${SPLUNK_HOME_LIB}" \
+CGO_LDFLAGS="-L${FW_DIR} -lsplunk_cabi \
+             -Wl,-rpath,${FW_DIR} \
+             -Wl,-rpath,${SPLUNK_HOME_LIB} \
+             -lstdc++ -ldl -lpthread" \
 go vet ./...
 ```
 
@@ -140,11 +151,11 @@ flowing before checking Splunk.
 
 | Stage | Detail |
 |-------|--------|
-| **filelog receiver** | Tails `demo/mock.log`; each line becomes one `plog.LogRecord` |
-| **attributes** | `splunk.sourcetype=filelog_demo`, `splunk.source=demo/mock.log` set on all records |
-| **resource** | `host.name=demo-otel-host` set on the resource scope |
-| **splunktcpout exporter** | Calls `tcpout_send()` per record; maps OTel attributes → S2S fields |
-| **Splunk indexer** | Receives events at `10.236.40.125:9997`, stored in index `main` |
+| **splunktail receiver** | Tails files matching the configured glob; each chunk becomes one `plog.LogRecord` with `Body: ValueTypeBytes` |
+| **attributes** | `splunk.sourcetype`, `splunk.source` stamped by tailin from inputs.conf |
+| **resource** | `host.name` set from tailin config |
+| **splunktcpout exporter** | `logBodyBytes()` extracts bytes from `ValueTypeBytes` (zero-copy) or `ValueTypeStr`; calls `splunk_pipeline_send()` per record |
+| **Splunk indexer** | Receives raw chunks at `10.236.40.125:9997`; line-breaking happens in the indexer's parsing pipeline |
 
 ---
 
@@ -155,14 +166,25 @@ See [`config.yaml`](config.yaml) for a ready-to-use example. All fields:
 ```yaml
 exporters:
   splunktcpout:
-    host: 10.236.40.125        # Splunk indexer hostname / IP  (required)
-    port: 9997                 # S2S receive port              (default: 9997)
+    framework: splunkframework # required
+    output_group: primary_indexers  # bare group name for [tcpout:primary_indexers]
     index: main                # Default Splunk index          (optional)
     default_source: otel       # source field fallback
     default_sourcetype: otel   # sourcetype field fallback     (default: "otel")
     default_host: ""           # host field fallback           (empty = local hostname)
     drain_seconds: 5           # Queue drain wait on shutdown  (default: 5)
-    splunk_home: /home/chli/splunk_home   # Sets SPLUNK_HOME before C init
+```
+
+Configure destinations in `outputs.conf`, owned by `splunkframeworkextension`:
+
+```ini
+[tcpout]
+defaultGroup = primary_indexers
+
+[tcpout:primary_indexers]
+server = idx1.example.com:9997, idx2.example.com:9997
+maxQueueSize = 8MB
+maxConnectionsPerIndexer = 4
 ```
 
 ### Log-record attribute → Splunk field mapping
@@ -173,6 +195,7 @@ exporters:
 | `splunk.sourcetype` | — | `sourcetype` | `default_sourcetype` |
 | `host.name` | `host.name` | `host` | `default_host` |
 | `splunk.index` | — | `index` | `index` config field |
+| `splunk.tcpout_group` | — | `_TCP_ROUTING` | `output_group` config field |
 
 Record-level attributes take priority over resource-level attributes, which take
 priority over the config-file defaults.
@@ -183,12 +206,13 @@ priority over the config-file defaults.
 
 ```bash
 export SPLUNK_HOME=/home/chli/splunk_home
-export LD_LIBRARY_PATH=/home/chli/main/src/output/tcpout_lib:/home/chli/splunk_home/lib
+export LD_LIBRARY_PATH=/home/chli/main/src/framework_cabi:/home/chli/splunk_home/lib
 ```
 
 `SPLUNK_HOME` must point to a directory containing an `etc/` sub-tree from which
-the Splunk framework reads `outputs.conf` and `server.conf`.  It can also be set
-via the `splunk_home:` field in the exporter config.
+the Splunk framework reads `outputs.conf` and `server.conf`. Set it on
+`splunkframeworkextension`; the exporter no longer owns `splunk_home`, indexer
+hostnames, or ports.
 
 ---
 
@@ -321,5 +345,4 @@ Three levers in rough implementation order:
    CPU.  Replacing it with a slower poll interval (e.g., `setDefaultPollInterval(100)`
    instead of fast mode) should reduce framework thread wake-ups by ~10×.  This
    requires a small change to `splunkfw_cabi.cpp` and re-linking `libsplunk_cabi.so`.
-
 

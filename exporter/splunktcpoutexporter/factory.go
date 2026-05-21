@@ -24,7 +24,6 @@ func NewFactory() exporter.Factory {
 func createDefaultConfig() component.Config {
 	return &Config{
 		Framework:         component.NewID(component.MustNewType("splunkframework")),
-		Port:              DefaultPort,
 		DefaultSourcetype: DefaultSourcetype,
 		DrainSeconds:      DefaultDrainSeconds,
 	}

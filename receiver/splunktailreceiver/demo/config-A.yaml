@@ -1,9 +1,16 @@
-# Binary A runtime config: splunkframeworkextension + splunktailreceiver → OTLP HTTP
+# Binary A runtime config: splunktailreceiver → OTLP HTTP → Binary B
 #
 # Run:
 #   LD_LIBRARY_PATH=/home/chli/main/src/framework_cabi:/home/chli/splunk_home/lib \
 #   SPLUNK_HOME=/home/chli/splunk_home \
 #   ./binA/splunktail-col --config config-A.yaml
+#
+# Tail inputs are read from splunkframeworkextension's inputs.conf cache.
+# Example stanza:
+#   [monitor:///tmp/e2e_fresh_*.log]
+#   disabled = 0
+#   sourcetype = tailin_e2e
+#   index = main
 
 extensions:
   splunkframework:
@@ -11,12 +18,7 @@ extensions:
 
 receivers:
   splunktail:
-    splunk_home: /home/chli/splunk_home
-    default_sourcetype: tailin_e2e
-    default_index: main
-    monitors:
-      - glob: /tmp/e2e_fresh_*.log
-        sourcetype: tailin_e2e
+    framework: splunkframework
 
 exporters:
   otlphttp:

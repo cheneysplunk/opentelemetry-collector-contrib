@@ -1,132 +1,128 @@
 # splunktailreceiver
 
-An OpenTelemetry Collector receiver that reads log files using the Splunk tail
-input library (`libtailinput_cabi.so`). Linux only (CGo).
+An OpenTelemetry Collector receiver that forwards native Splunk file-tail input
+data into an OTel logs pipeline.
 
----
+The receiver no longer owns Splunk CGo or receiver-side monitor config. It
+looks up `splunkframeworkextension`, asks the extension to create a native
+TailManager pipeline from the extension-owned merged `inputs.conf` cache, and
+then forwards the raw byte chunks delivered by that pipeline.
 
-## Architecture
+**Output body type:** `ValueTypeBytes` when the CABI delivers raw bytes. The
+receiver preserves those bytes in `plog.LogRecord.Body`.
 
-### Two-process pipeline
-
-The two CGo libraries share global Splunk framework singletons and **cannot
-coexist in one process**:
-
-| Library | Bootstrap | Why it conflicts |
-|---|---|---|
-| `libtailinput_cabi.so` | `SplunkMainThread` (full EventLoop, singleton `_instance`) | `TailManager` uses `ScopedJoinAndDelete` → `SplunkMainThread::runInThreadNowait` → dereferences `_instance` unconditionally |
-| `libtcpout_cabi.so` | `EmptyMainThread` (no EventLoop) | `MainThread()` constructor **throws** if a `MainThread` already exists |
-
-Because of this, the full tail→index pipeline runs as **two separate collector
-binaries** bridged by OTLP HTTP:
+## Pipeline
 
 ```
-┌─────────────────────────────┐        OTLP HTTP        ┌──────────────────────────────────┐
-│  splunktail-col  (Binary A) │ ───── localhost:4318 ──► │  splunktcpout-otlp-col (Binary B) │
-│                             │                          │                                  │
-│  splunktailreceiver         │                          │  otlpreceiver                    │
-│    └─ libtailinput_cabi.so  │                          │  splunktcpoutexporter            │
-│         SplunkMainThread    │                          │    └─ libtcpout_cabi.so          │
-│                             │                          │         EmptyMainThread          │
-└─────────────────────────────┘                          └──────────────────────────────────┘
-                                                                        │
-                                                                        ▼
-                                                             Splunk indexer (S2S TCP)
-                                                             e.g. 10.236.40.125:9997
+$SPLUNK_HOME/etc/**/inputs.conf
+      │
+      │  loaded/merged by splunkframeworkextension at startup
+      ▼
+splunkframeworkextension             [CGo lives here]
+  ConfManager / PropertyPages cache
+  NewMonitorPipeline()
+      │
+      ▼
+libsplunk_cabi.so
+  TailManager / TailWatcher / TailReader
+  WatchedTailFile::readChunk()
+      │
+      │ raw bytes + native source/sourcetype/host metadata
+      ▼
+splunktailreceiver                   [pure Go]
+  plog.LogRecord.Body: ValueTypeBytes
+  attributes: splunk.source, splunk.sourcetype
+      │
+      ▼
+OTel processors / exporters
 ```
 
-For the design rationale, component hierarchy, path to single-process architecture,
-and the splunkd-as-sidecar alternative, see [shared_extensions.md](shared_extensions.md).
+The receiver does **not** create `monitor://` stanzas from OTel config. To add,
+change, or remove tailed files, edit `inputs.conf` or use the extension's native
+`configs/conf-inputs` REST API.
 
-### Why extra files get ingested (inputs.conf)
+## Configuration
 
-`tailin_create()` calls `LoaderInfo::instance()->populateFromEnvironment()`,
-which causes the Splunk framework to load **all inputs** from:
+```yaml
+extensions:
+  splunkframework:
+    splunk_home: /opt/splunk
+    management_port: 8089   # optional; enables auth/login + configs/conf-* REST
 
+receivers:
+  splunktail:
+    framework: splunkframework
+
+service:
+  extensions: [splunkframework]
+  pipelines:
+    logs:
+      receivers: [splunktail]
+      exporters: [...]
 ```
-$SPLUNK_HOME/etc/system/default/inputs.conf   ← 13 built-in stanzas
-$SPLUNK_HOME/etc/system/local/inputs.conf
-$SPLUNK_HOME/etc/apps/*/default/inputs.conf
+
+Example `inputs.conf`:
+
+```ini
+[monitor:///var/log/myapp/*.log]
+disabled = 0
+sourcetype = myapp
+index = main
 ```
 
-The built-in `[monitor://$SPLUNK_HOME/etc/splunk.version]` stanza (line 39 of
-`default/inputs.conf`) is one example. The `TailManager` monitors every stanza
-it finds, not just the user-configured globs.
+Legacy receiver fields such as `monitors`, `splunk_home`,
+`default_sourcetype`, `default_index`, `host`, and `fishbucket_dir` are accepted
+for config compatibility but ignored. The extension owns `SPLUNK_HOME`, and the
+native TailManager owns monitor behavior.
 
-Events from these built-in inputs arrive at `goTailinEventCallback` with their
-own sourcetypes (`splunk_version`, etc.). The callback currently forwards
-everything — filter by sourcetype in the callback if you only want user-defined
-monitors.
+## Behavior
 
----
+- Startup matches the Splunk shape more closely: the extension initializes the
+  framework and merged conf cache first; the receiver starts a tail pipeline
+  from that cache.
+- Only one `splunktailreceiver` may be active per Collector process. The native
+  tail CABI has one process-global callback path and parsing queue, so the
+  extension rejects a second monitor pipeline instead of risking duplicated or
+  misrouted data.
+- Full monitor stanza behavior stays native because TailManager reads
+  `inputs.conf` directly. Settings such as `blacklist`, `whitelist`,
+  `recursive`, `crcSalt`, `ignoreOlderThan`, and fishbucket state are not
+  re-modeled in Go.
+- `configs/conf-*` REST CRUD changes do not automatically restart the running
+  tail pipeline. Use explicit reload/restart behavior when changing active
+  inputs, matching the current conf-management design decision.
 
 ## Building
 
-Both binaries are built from generated source under `demo/`:
+Build the unified collector with `splunkframeworkextension` included. Only the
+extension needs linker flags for `libsplunk_cabi.so`.
 
 ```bash
-DEMO=/path/to/receiver/splunktailreceiver/demo
+DEMO=/home/chli/otel/opentelemetry-collector-contrib/exporter/splunktcpoutexporter/demo
+FW_DIR=/home/chli/main/src/framework_cabi
+SPLUNK_HOME=/home/chli/splunk_home
 
-# Generate sources (skip compilation)
-GOPATH=/home/chli/go builder --config $DEMO/builder-config-A.yaml --skip-compilation=true
-GOPATH=/home/chli/go builder --config $DEMO/builder-config-B.yaml --skip-compilation=true
-
-# Build Binary A (splunktailreceiver + otlphttpexporter)
-cd $DEMO/binA
-CGO_CFLAGS="-I/home/chli/main/src/input/tail_lib" \
-CGO_LDFLAGS="-L/home/chli/main/src/input/tail_lib -L/home/chli/splunk_home/lib \
-             -Wl,-rpath,/home/chli/main/src/input/tail_lib \
-             -Wl,-rpath,/home/chli/splunk_home/lib" \
+CGO_LDFLAGS="-L${FW_DIR} -lsplunk_cabi \
+             -Wl,-rpath,${FW_DIR} \
+             -Wl,-rpath,${SPLUNK_HOME}/lib \
+             -lstdc++ -ldl -lpthread" \
 GOPATH=/home/chli/go \
-go build -trimpath -o splunktail-col -ldflags="-s -w" .
-
-# Build Binary B (otlpreceiver + splunktcpoutexporter)
-cd $DEMO/binB
-CGO_CFLAGS="-I/home/chli/main/src/output/tcpout_lib" \
-CGO_LDFLAGS="-L/home/chli/main/src/output/tcpout_lib -L/home/chli/splunk_home/lib \
-             -Wl,-rpath,/home/chli/main/src/output/tcpout_lib \
-             -Wl,-rpath,/home/chli/splunk_home/lib" \
-GOPATH=/home/chli/go \
-go build -trimpath -o splunktcpout-otlp-col -ldflags="-s -w" .
+/home/chli/go/bin/builder --config ${DEMO}/builder-config-unified.yaml
 ```
 
-The `builder` binary is at `/home/chli/go/bin/builder` (ocb v0.151.0).
-
----
-
-## Running (E2E test)
+## Running
 
 ```bash
-DEMO=/path/to/receiver/splunktailreceiver/demo
-
-# 1. Start Binary B first (OTLP receiver → Splunk indexer)
-LD_LIBRARY_PATH=/home/chli/main/src/output/tcpout_lib:/home/chli/splunk_home/lib \
+LD_LIBRARY_PATH=/home/chli/main/src/framework_cabi:/home/chli/splunk_home/lib \
 SPLUNK_HOME=/home/chli/splunk_home \
-$DEMO/binB/splunktcpout-otlp-col --config $DEMO/config-B.yaml &
-
-# 2. Start Binary A (tail reader → OTLP)
-LD_LIBRARY_PATH=/home/chli/main/src/input/tail_lib:/home/chli/splunk_home/lib \
-SPLUNK_HOME=/home/chli/splunk_home \
-$DEMO/binA/splunktail-col --config $DEMO/config-A.yaml
+${DEMO}/bin-unified/splunk-col --config ${DEMO}/config-unified.yaml
 ```
 
-Verify in Splunk:
-```
-index=main sourcetype=tailin_e2e | stats count
-```
-
----
-
-## Key source files
+## Key Source Files
 
 | File | Purpose |
 |---|---|
-| `receiver.go` | Linux CGo receiver implementation, `goTailinEventCallback` trampoline |
-| `receiver_unsupported.go` | Stub for non-Linux platforms |
-| `factory.go` | `receiver.Factory` registration |
-| `config.go` | `Config` struct with `Monitors`, `SplunkHome`, etc. |
-| `tailin_cabi.h` | Vendored C header from `main/src/input/tail_lib/` |
-| `demo/config-A.yaml` | Binary A runtime config |
-| `demo/config-B.yaml` | Binary B runtime config |
-| `demo/builder-config-A.yaml` | ocb builder config for Binary A |
-| `demo/builder-config-B.yaml` | ocb builder config for Binary B |
+| `receiver.go` | Looks up `splunkframeworkextension`, starts `NewMonitorPipeline`, forwards events |
+| `config.go` | Receiver config; only `framework` is active |
+| `extension/splunkframeworkextension/monitor_pipeline.go` | Creates native monitor pipeline from merged `inputs.conf` |
+| `main/src/input/tail_lib/tailin_cabi.cpp` | Native TailManager CABI; can start from existing `inputs.conf` without programmatic monitors |

@@ -11,8 +11,6 @@ import (
 )
 
 const (
-	// DefaultPort is the standard Splunk S2S receive port.
-	DefaultPort = 9997
 	// DefaultSourcetype is the Splunk sourcetype assigned when a log record
 	// carries no "splunk.sourcetype" attribute.
 	DefaultSourcetype = "otel"
@@ -27,10 +25,15 @@ type Config struct {
 	// Defaults to "splunkframework". Must be listed in service.extensions.
 	Framework component.ID `mapstructure:"framework"`
 
-	// Host is the Splunk indexer hostname or IP address. Required.
+	// OutputGroup is the bare outputs.conf tcpout group name, e.g. "prod" for
+	// [tcpout:prod]. Required.
+	OutputGroup string `mapstructure:"output_group"`
+
+	// Host is deprecated and ignored. Configure server addresses in
+	// outputs.conf under the selected output_group.
 	Host string `mapstructure:"host"`
 
-	// Port is the Splunk indexer S2S receive port (default: 9997).
+	// Port is deprecated and ignored. Configure server addresses in outputs.conf.
 	Port int `mapstructure:"port"`
 
 	// Index is the default Splunk index for forwarded events.
@@ -54,11 +57,8 @@ type Config struct {
 	// drain before forcing shutdown (default: 5).
 	DrainSeconds int `mapstructure:"drain_seconds"`
 
-	// SplunkHome, when non-empty, is written to the SPLUNK_HOME environment
-	// variable before the C library is initialised.  It must point to a
-	// directory containing an etc/ sub-tree (e.g. /opt/splunk or a minimal
-	// UF skeleton).  If empty the existing SPLUNK_HOME environment variable
-	// is used.
+	// SplunkHome is deprecated and ignored. Set splunk_home on the
+	// splunkframeworkextension instead.
 	SplunkHome string `mapstructure:"splunk_home"`
 }
 
@@ -67,11 +67,8 @@ func (c *Config) Validate() error {
 	if c.Framework == (component.ID{}) {
 		return fmt.Errorf("splunktcpoutexporter: framework must not be empty; set it to the extension id (e.g. splunkframework)")
 	}
-	if c.Host == "" {
-		return errors.New("host is required")
-	}
-	if c.Port < 1 || c.Port > 65535 {
-		return errors.New("port must be in the range 1–65535")
+	if c.OutputGroup == "" {
+		return errors.New("output_group is required")
 	}
 	if c.DrainSeconds < 0 {
 		return errors.New("drain_seconds must be non-negative")

@@ -2,17 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package splunktailreceiver implements a Splunk tail-input receiver that
-// watches log files using the native Splunk TailReader / TailWatcher pipeline
-// (via libtailinput_cabi.so) and emits each line-broken event as an OTel
-// log record.
+// obtains a native TailManager pipeline from splunkframeworkextension and emits
+// raw file chunks as OTel log records.
 //
-// Build constraint: Linux only (requires CGo and libtailinput_cabi.so).
-//
-// Build:
-//
-//	CGO_CFLAGS="-I/path/to/tail_lib" \
-//	CGO_LDFLAGS="-L/path/to/tail_lib -L/path/to/splunk_home/lib \
-//	             -Wl,-rpath,/path/to/tail_lib \
-//	             -Wl,-rpath,/path/to/splunk_home/lib" \
-//	go build ./...
+// Build constraint: Linux only because the paired splunkframeworkextension owns
+// the Splunk CABI and runtime linkage.
 package splunktailreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunktailreceiver"

@@ -4,32 +4,44 @@
  * Plain C interface to the Splunk tail-input library.
  * This header is the ONLY thing callers need — no Splunk headers required.
  *
- * This wraps the real Splunk TailReader / TailWatcher / WatchedTailFile
- * pipeline, including fish-bucket position persistence, CRC-based file
- * identity, log-rotation detection, line-breaking, charset detection,
- * archive reading, and props.conf transforms.
+ * Wraps Stage 1 of the splcore file-input pipeline: TailReader /
+ * TailWatcher / WatchedTailFile, including fish-bucket position persistence,
+ * CRC-based file identity, log-rotation detection, charset detection,
+ * archive reading, and inputs.conf / props.conf configuration.
+ *
+ * The CABI delivers raw file chunks — identical to what the UF's tcpout
+ * processor receives.  The downstream parsing pipeline (line-breaking,
+ * header processing, timestamp extraction) is NOT included; the caller
+ * is responsible for those steps.
+ *
+ * Metadata stamped by the tail reader on every chunk (from inputs.conf):
+ *   source      = "source::/absolute/path/to/file"
+ *   sourcetype  = value from inputs.conf stanza
+ *   host        = value from inputs.conf stanza (or gethostname)
+ *   index       = value from inputs.conf stanza
+ *   timestamp   = file mtime (fallback; real extraction is downstream)
  *
  * Model: callback-based (push to caller).
- * The library owns a parsing-pipeline thread.  For each fully line-broken
- * event read from a watched file, tailin_event_cb is called from that
- * thread.  The callback must return quickly; heavy work should be
- * dispatched to a separate goroutine/thread.
+ * The library owns a minimal pipeline thread (QueueInputProcessor only).
+ * For each raw file chunk read from a watched file, tailin_bytes_cb is
+ * called from that thread.  The callback must return quickly; heavy work
+ * should be dispatched to a separate goroutine/thread.
  *
  * Usage (C / C++):
  *   #include "tailin_cabi.h"
  *
- *   void on_event(const char* data, size_t len,
+ *   void on_chunk(const uint8_t* data, size_t len,
  *                 const char* source,
  *                 const char* sourcetype,
  *                 const char* host,
  *                 time_t      event_time,
  *                 void*       userdata) {
- *       // handle event
+ *       // data is a raw file chunk — may contain many lines
  *   }
  *
  *   TailinConfig cfg = tailin_default_config();
  *   cfg.default_sourcetype = "myapp";
- *   TailinHandle* h = tailin_create(on_event, NULL, &cfg);
+ *   TailinHandle* h = tailin_create_bytes(on_chunk, NULL, &cfg);
  *   tailin_add_monitor(h, "/var/log/myapp/*.log", "myapp", NULL, NULL);
  *   tailin_start(h);
  *   // ... later ...
@@ -53,32 +65,34 @@
 extern "C" {
 #endif
 
-/** Opaque session handle returned by tailin_create(). */
+/** Opaque session handle returned by tailin_create_bytes(). */
 typedef struct TailinHandle TailinHandle;
 
 /**
- * tailin_event_cb — called once per fully line-broken event.
+ * tailin_bytes_cb — called once per raw file chunk.
  *
- * @param data        Event bytes (NUL-terminated for convenience).
- * @param len         Length of @p data in bytes (excluding the NUL).
- * @param source      Absolute path of the file (never NULL).
- * @param sourcetype  Sourcetype field value (never NULL).
- * @param host        Host field value (never NULL).
- * @param event_time  Unix timestamp assigned by the Splunk pipeline.
- *                    0 if not set.
- * @param userdata    The pointer passed to tailin_create().
+ * @param data        Raw file chunk bytes.  NOT NUL-terminated.
+ *                    May contain many lines; the caller is responsible
+ *                    for line-breaking.
+ * @param len         Length of @p data in bytes.
+ * @param source      File path as "source::/absolute/path" (never NULL).
+ * @param sourcetype  Sourcetype from inputs.conf (never NULL).
+ * @param host        Host from inputs.conf or gethostname (never NULL).
+ * @param event_time  File mtime (fallback; real timestamp extraction is
+ *                    downstream).  0 if not set.
+ * @param userdata    The pointer passed to tailin_create_bytes().
  *
- * The callback is invoked from the parsing-pipeline thread.  Do not
- * call any tailin_* functions from within the callback.
+ * The callback is invoked from the pipeline thread (not the TailReader
+ * thread).  Do not call any tailin_* functions from within the callback.
  */
-typedef void (*tailin_event_cb)(
-    const char* data,
-    size_t      len,
-    const char* source,
-    const char* sourcetype,
-    const char* host,
-    time_t      event_time,
-    void*       userdata
+typedef void (*tailin_bytes_cb)(
+    const uint8_t* data,
+    size_t         len,
+    const char*    source,
+    const char*    sourcetype,
+    const char*    host,
+    time_t         event_time,
+    void*          userdata
 );
 
 /**
@@ -116,27 +130,57 @@ typedef struct TailinConfig {
 TailinConfig tailin_default_config(void);
 
 /**
- * tailin_create() — create a tail-input handle (does NOT start tailing yet).
+ * tailin_create_bytes() — create a tail-input handle (does NOT start tailing yet).
  *
- * Bootstraps the Splunk framework (Logger, LoaderInfo, BundlesSetup,
- * PropertyPages, PipelineComponent) and registers a single PipelineSet.
- * This must be called at most once per process.
+ * Requires the shared Splunk framework to be running (call splunkfw_init()
+ * first).  Registers a minimal pipeline (QueueInputProcessor only — no
+ * line-breaking, no header processing) that delivers raw file chunks
+ * to @p cb.  This must be called at most once per process.
  *
- * @param cb         Event callback, called once per line-broken event.
+ * @param cb         Bytes callback, called once per raw file chunk.
+ *                   The chunk may contain many lines; the caller is
+ *                   responsible for line-breaking.
  * @param userdata   Opaque pointer forwarded to every cb invocation.
  * @param cfg        Optional configuration; pass NULL for defaults.
  *
  * @return  Opaque handle on success, NULL on failure.
  *          Call tailin_last_error() for a human-readable reason.
  */
-TailinHandle* tailin_create(tailin_event_cb    cb,
-                             void*              userdata,
-                             const TailinConfig* cfg);
+TailinHandle* tailin_create_bytes(tailin_bytes_cb     cb,
+                                   void*               userdata,
+                                   const TailinConfig* cfg);
 
 /**
- * tailin_add_monitor() — register a glob pattern to watch.
+ * tailin_set_props() — set an in-memory props.conf key for a sourcetype.
+ *
+ * Must be called after tailin_create[_bytes]() and before tailin_start().
+ * Allows programmatic configuration of props.conf settings such as
+ * INDEXED_EXTRACTIONS, DATETIME_CONFIG, LINE_BREAKER, etc. without
+ * requiring a props.conf file on disk.
+ *
+ * Example — enable JSON indexed extraction for sourcetype "myapp":
+ *   tailin_set_props(h, "myapp", "INDEXED_EXTRACTIONS", "json");
+ *
+ * Supported INDEXED_EXTRACTIONS values: "json", "csv", "tsv", "psv", "w3c"
+ *
+ * @param handle      Handle returned by tailin_create[_bytes]().
+ * @param sourcetype  The props.conf stanza name (sourcetype).
+ * @param key         Property key, e.g. "INDEXED_EXTRACTIONS".
+ * @param value       Property value, e.g. "json".
+ *
+ * @return  0 on success, -1 on error (see tailin_last_error()).
+ */
+int tailin_set_props(TailinHandle* handle,
+                     const char*   sourcetype,
+                     const char*   key,
+                     const char*   value);
+
+/**
+ * tailin_add_monitor() — register a programmatic glob pattern to watch.
  *
  * Must be called after tailin_create() and before tailin_start().
+ * Optional: callers may skip this entirely when they want TailManager to use
+ * the merged inputs.conf cache loaded from SPLUNK_HOME.
  * Writes an in-memory inputs.conf stanza:
  *   [monitor://<glob>]
  *   sourcetype = <sourcetype>
@@ -159,8 +203,9 @@ int tailin_add_monitor(TailinHandle* handle,
 /**
  * tailin_start() — start the TailManager, TailReader, and parsing pipeline.
  *
- * Must be called exactly once after tailin_create() and all
- * tailin_add_monitor() calls.
+ * Must be called exactly once after tailin_create() and any
+ * tailin_add_monitor() calls. If no monitors were added programmatically,
+ * the native TailManager reads the already-loaded merged inputs.conf cache.
  *
  * @return  0 on success, -1 on error (see tailin_last_error()).
  */
