@@ -73,6 +73,52 @@ Scripted inputs are convenient to configure with the structured `scripts` list.
 Modular inputs should use `inputs_conf` because the native scheme stanza and
 modular input instance stanza often both matter.
 
+## Modular input XML protocol
+
+The exec receiver uses Splunk's modular input XML protocol. The native
+`ExecProcessor` generates an `<input>` XML document and pipes it to the
+script's stdin. The script writes `<event>` elements wrapped in a `<stream>`
+to stdout, which the receiver parses into OTel log records.
+
+**Input XML (piped to the script's stdin):**
+
+```xml
+<input>
+  <server_host>otel-exec-test-host</server_host>
+  <server_uri>https://localhost:8089</server_uri>
+  <session_key>test-session-key-123</session_key>
+  <checkpoint_dir>/tmp/otel_exec_checkpoint</checkpoint_dir>
+  <configuration>
+    <stanza name="otel_exec_python_file_input://exec_receiver">
+      <param name="file_path">/tmp/otel_exec_test_input.txt</param>
+      <param name="sourcetype">otel_exec_python_file_input</param>
+      <param name="source">otel_exec_python_file_input_source</param>
+      <param name="host">otel-python-file-host</param>
+      <param name="index">main</param>
+    </stanza>
+  </configuration>
+</input>
+```
+
+**Output XML (written to stdout by the script):**
+
+```xml
+<stream>
+  <event unbroken="1" stanza="otel_exec_python_file_input://exec_receiver">
+    <source>otel_exec_python_file_input_source</source>
+    <sourcetype>otel_exec_python_file_input</sourcetype>
+    <index>main</index>
+    <host>otel-python-file-host</host>
+    <time>1780443803.721</time>
+    <data>hello from exec receiver</data>
+    <done/>
+  </event>
+</stream>
+```
+
+Each `<event>` is parsed into an OTel log record with source/sourcetype/host
+mapped to log attributes and `<data>` as the log body.
+
 ## Runtime ownership
 
 Use exactly one shared `splunkframeworkextension` for Splunk-backed OTel
