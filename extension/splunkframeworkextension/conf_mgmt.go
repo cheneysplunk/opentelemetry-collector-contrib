@@ -23,10 +23,9 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/splunkframeworkextension/splunkapi"
 )
 
-// ConfManager returns the Splunk conf/auth management wrapper.
-// Start eagerly creates this manager so the native merged conf cache is ready
-// before receivers, processors, and exporters start. The lazy path is kept for
-// tests and defensive use.
+// ConfManager returns the Splunk conf/auth management wrapper. The manager is
+// created lazily unless management_port is set, in which case Start creates it
+// before launching the REST management surface.
 func (e *splunkFrameworkExtension) ConfManager() (splunkapi.ConfManager, error) {
 	e.confMu.Lock()
 	defer e.confMu.Unlock()

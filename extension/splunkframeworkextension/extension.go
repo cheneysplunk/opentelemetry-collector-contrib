@@ -162,19 +162,20 @@ func (e *splunkFrameworkExtension) Start(_ context.Context, _ component.Host) er
 			C.GoString(C.splunkfw_last_error()))
 	}
 
-	e.confMu.Lock()
-	confMgr := e.confMgr
-	if confMgr == nil {
-		var err error
-		confMgr, err = newCConfManager(e.cfg.SplunkHome)
-		if err != nil {
-			e.confMu.Unlock()
-			C.splunkfw_shutdown()
-			return fmt.Errorf("splunkframeworkextension: conf manager init failed: %w", err)
-		}
-		e.confMgr = confMgr
-	}
+	confManagerLoaded := false
 	if e.cfg.ManagementPort > 0 {
+		e.confMu.Lock()
+		confMgr := e.confMgr
+		if confMgr == nil {
+			var err error
+			confMgr, err = newCConfManager(e.cfg.SplunkHome)
+			if err != nil {
+				e.confMu.Unlock()
+				C.splunkfw_shutdown()
+				return fmt.Errorf("splunkframeworkextension: conf manager init failed: %w", err)
+			}
+			e.confMgr = confMgr
+		}
 		if err := confMgr.StartREST(e.cfg.ManagementPort); err != nil {
 			e.confMgr = nil
 			e.confMu.Unlock()
@@ -182,12 +183,13 @@ func (e *splunkFrameworkExtension) Start(_ context.Context, _ component.Host) er
 			C.splunkfw_shutdown()
 			return fmt.Errorf("splunkframeworkextension: REST server init failed: %w", err)
 		}
+		confManagerLoaded = true
+		e.confMu.Unlock()
 	}
-	e.confMu.Unlock()
 
 	fields := []zap.Field{
 		zap.String("splunk_home", e.cfg.SplunkHome),
-		zap.Bool("conf_cache_loaded", true),
+		zap.Bool("conf_manager_loaded", confManagerLoaded),
 	}
 	if e.cfg.ManagementPort > 0 {
 		fields = append(fields, zap.Int("management_port", e.cfg.ManagementPort))

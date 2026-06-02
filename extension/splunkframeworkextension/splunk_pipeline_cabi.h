@@ -3,7 +3,8 @@
  *
  * Generic plain-C interface to the Splunk pipeline framework.
  *
- * Instead of component-specific APIs (tailin_create, tcpout_create, …),
+ * Instead of component-specific APIs (tailin_create, execproc_create,
+ * tcpout_create, ...),
  * this interface accepts raw Splunk conf stanza text and drives any
  * Splunk component that can be expressed in inputs.conf / outputs.conf /
  * props.conf.  No new CABI file is needed when adding new component types.
@@ -21,15 +22,20 @@
  * Usage (input)
  * -------------
  *   const char* inputs =
- *       "[monitor:///var/log/app/*.log]\n"
+ *       "[script://./bin/my_input]\n"
+ *       "interval = 60\n"
  *       "sourcetype = myapp\n"
  *       "index = main\n";
  *
  *   SplunkPipeline* p = splunk_pipeline_create(inputs, NULL, NULL, my_cb, ctx);
  *   splunk_pipeline_start(p);
- *   // … events arrive via my_cb …
+ *   // events arrive via my_cb
  *   splunk_pipeline_stop(p);
  *   splunk_pipeline_destroy(p);
+ *
+ * Modular exec inputs can be passed the same way with stanzas such as
+ * [my_scheme] and [my_scheme://name], provided the app that owns the modular
+ * input executable and inputs.conf.spec is present under SPLUNK_HOME.
  *
  * Usage (output)
  * --------------
@@ -72,9 +78,9 @@ extern "C" {
 typedef struct SplunkPipeline SplunkPipeline;
 
 /**
- * splunk_event_cb — called once per fully line-broken event from an input.
+ * splunk_event_cb — called for each event/raw chunk from an input.
  *
- * @param data        Event bytes (NUL-terminated for convenience).
+ * @param data        Event or raw input bytes (NUL-terminated for convenience).
  * @param len         Length of data in bytes (excluding NUL).
  * @param source      Absolute path or URI of the source (never NULL).
  * @param sourcetype  Sourcetype field value (never NULL).
@@ -113,33 +119,6 @@ typedef void (*splunk_bytes_cb)(
     void*          userdata
 );
 
-/**
- * splunk_pipeline_create() — create a pipeline from raw conf stanza text.
- *
- * All stanza arguments accept the same syntax as the corresponding
- * Splunk .conf files, including multiple stanzas separated by newlines.
- * Pass NULL or "" for any stanza that is not needed.
- *
- * @param inputs_conf   Raw inputs.conf stanza(s), e.g.:
- *                        "[monitor:///var/log/*.log]\nsourcetype=myapp\n"
- *                        "[udp://514]\nsourcetype=syslog\n"
- * @param outputs_conf  Raw outputs.conf stanza(s), e.g.:
- *                        "[tcpout]\ndefaultGroup=grp\n"
- *                        "[tcpout:grp]\nserver=10.0.0.1:9997\n"
- * @param props_conf    Raw props.conf stanza(s), or NULL for defaults.
- * @param cb            Event callback for input events; NULL for output-only.
- * @param userdata      Forwarded to every cb invocation.
- *
- * @return  Opaque handle on success, NULL on failure.
- *          Call splunk_pipeline_last_error() for details.
- */
-SplunkPipeline* splunk_pipeline_create(
-    const char*    inputs_conf,
-    const char*    outputs_conf,
-    const char*    props_conf,
-    splunk_event_cb cb,
-    void*          userdata
-);
 
 /**
  * splunk_pipeline_create_bytes() — raw-bytes variant of splunk_pipeline_create().

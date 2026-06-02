@@ -80,9 +80,11 @@ type ConfSession interface {
 // Standard Splunk .conf syntax: [stanza-header]\nkey = value\n...
 type PipelineConfig struct {
 	// InputsConf is raw inputs.conf stanza text. Empty for output-only.
-	// Supported stanza types (Phase 1): monitor://
+	// Supported stanza types: monitor://, script://, and modular exec input
+	// schemes such as my_scheme://name.
 	// Example:
-	//   [monitor:///var/log/*.log]
+	//   [script://./bin/my_input]
+	//   interval = 60
 	//   sourcetype = myapp
 	//   index = main
 	InputsConf string

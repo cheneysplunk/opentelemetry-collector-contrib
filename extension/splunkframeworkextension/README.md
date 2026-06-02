@@ -18,12 +18,18 @@ OpenTelemetry Collector extension that boots the Splunk C++ framework and expose
 │  │  • exports splunkapi.SplunkFramework interface       │   │
 │  └────────────────────┬─────────────────┬──────────────┘   │
 │                        │ cfg.Framework   │                   │
-│  ┌─────────────────────▼───┐  ┌─────────▼─────────────┐    │
-│  │  splunktailreceiver      │  │  splunktcpoutexporter  │    │
-│  │  [pure Go, no CGo]       │  │  [pure Go, no CGo]    │    │
-│  │  fw.NewMonitorPipeline() │  │  builds OutputsConf   │    │
-│  │  from inputs.conf cache  │  │  fw.NewPipeline(...)  │    │
-│  └──────────────────────────┘  └───────────────────────┘    │
+  │  ┌─────────────────────▼───┐  ┌─────────▼─────────────┐    │
+  │  │  splunktailreceiver      │  │  splunkexecreceiver    │    │
+  │  │  [pure Go, no CGo]       │  │  [pure Go, no CGo]    │    │
+  │  │  fw.NewMonitorPipeline() │  │  builds script://     │    │
+  │  │  from inputs.conf cache  │  │  fw.NewPipeline(...)  │    │
+  │  └──────────────────────────┘  └─────────┬─────────────┘    │
+  │                                          │                  │
+  │                         ┌────────────────▼────────────┐     │
+  │                         │ splunktcpoutexporter         │     │
+  │                         │ [pure Go, no CGo]            │     │
+  │                         │ fw.NewOutputPipeline(...)    │     │
+  │                         └──────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -39,7 +45,7 @@ fw := ext.(splunkapi.SplunkFramework)
 p, err := fw.NewMonitorPipeline()
 ```
 
-No C headers, no linker flags, no CGo are needed in the receiver or exporter modules. The tail receiver no longer passes receiver-side `monitor://` config; the extension starts TailManager from the native merged `inputs.conf` cache. Processors can use the same lookup pattern and call `fw.ConfManager()` to read, write, reload, or auth-check Splunk `.conf` state through the pure-Go `splunkapi` interface.
+No C headers, no linker flags, no CGo are needed in the receiver or exporter modules. The tail receiver no longer passes receiver-side `monitor://` config; the extension starts TailManager from the native merged `inputs.conf` cache. The exec receiver builds native `script://` stanza text and calls `fw.NewPipeline()` through the same pure-Go interface. Processors can use the same lookup pattern and call `fw.ConfManager()` to read, write, reload, or auth-check Splunk `.conf` state through `splunkapi`.
 
 ## Package layout
 
@@ -52,6 +58,7 @@ splunkframeworkextension/
   config.go                 # Config struct (splunk_home, splunk_db, management_port)
   factory.go                # component.NewFactory registration
   conf_mgmt_cabi.h          # Vendored: Splunk conf/auth management CABI
+  exec_processor_cabi.h     # Vendored: Splunk scripted-input CABI
   splunkfw_cabi.h           # Vendored: Splunk framework bootstrap API
   splunk_pipeline_cabi.h    # Vendored: generic conf-driven pipeline CABI
   splunkapi/
@@ -71,7 +78,7 @@ splunkframeworkextension/
 
 | Field | Purpose |
 |---|---|
-| `InputsConf` | `inputs.conf` stanzas — `[monitor://glob]`, `[default]` |
+| `InputsConf` | `inputs.conf` stanzas — `[monitor://glob]`, `[script://cmd]`, modular exec stanzas such as `[my_scheme://name]`, `[default]` |
 | `OutputsConf` | `outputs.conf` stanzas — `[tcpout]`, `[tcpout:group]` |
 | `PropsConf` | `props.conf` stanzas (Phase 2, currently unused) |
 
@@ -98,13 +105,14 @@ main/src/framework_cabi/
   splunkfw_cabi.h / (built into splunkd's object tree)    # framework init/shutdown
   conf_mgmt_cabi.h / conf_mgmt_cabi.cpp                   # conf CRUD + auth/authz CABI
   tailin_cabi.h   / tailin_cabi.cpp                       # file-tail input CABI
+  exec_processor_cabi.h / exec_processor_cabi.cpp          # scripted-input ExecProcessor CABI
   tcpout_cabi.h   / tcpout_cabi.cpp                       # S2S TCP output CABI
   splunk_pipeline_cabi.h / splunk_pipeline_cabi.cpp        # conf-text generic router
 ```
 
 The `*_cabi.h` files define a **plain-C ABI** (no C++ types, no name mangling) so CGo can call them directly. The `*_cabi.cpp` files include internal Splunk headers from `main/src/` and call the real C++ classes.
 
-`splunk_pipeline_cabi.cpp` is a conf-text router: it parses raw `.conf` stanza text and delegates to `tailin_cabi` or `tcpout_cabi` internally. No new Go interface change is needed when adding a new stanza type — only a new branch in the router.
+`splunk_pipeline_cabi.cpp` is a conf-text router: it parses raw `.conf` stanza text and delegates to `tailin_cabi`, `exec_processor_cabi`, or `tcpout_cabi` internally. No new Go interface change is needed when adding a new stanza type — only a new branch in the router.
 
 All CABI `.o` files are merged into one shared library:
 
@@ -112,6 +120,7 @@ All CABI `.o` files are merged into one shared library:
 splunkfw_cabi.o         ─┐
 conf_mgmt_cabi.o        ─┤
 tailin_cabi.o           ─┤── libsplunk_cabi.so
+exec_processor_cabi.o   ─┤
 tcpout_cabi.o           ─┤
 splunk_pipeline_cabi.o  ─┘
 ```
@@ -133,7 +142,7 @@ cd main/src/framework_cabi && make -j$(nproc)
 
 ### Building the OTel extension
 
-Only `CGO_LDFLAGS` is required — the C headers (`splunkfw_cabi.h`, `splunk_pipeline_cabi.h`, `conf_mgmt_cabi.h`) are vendored in this directory and found automatically via `#cgo CFLAGS: -I${SRCDIR}`.
+Only `CGO_LDFLAGS` is required — the C headers (`splunkfw_cabi.h`, `splunk_pipeline_cabi.h`, `conf_mgmt_cabi.h`, `exec_processor_cabi.h`) are vendored in this directory and found automatically via `#cgo CFLAGS: -I${SRCDIR}`.
 
 ```sh
 FW_DIR=/path/to/main/src/framework_cabi
@@ -191,6 +200,12 @@ extensions:
 receivers:
   splunktail:
     framework: splunkframework  # component ID of the extension above
+  splunkexec:
+    framework: splunkframework
+    scripts:
+      - command: ./bin/my_input
+        interval: "60"
+        sourcetype: my_input
 
 exporters:
   splunktcpout:
@@ -203,11 +218,14 @@ service:
     logs:
       receivers: [splunktail]
       exporters: [splunktcpout]
+    scripted:
+      receivers: [splunkexec]
+      exporters: [splunktcpout]
 ```
 
-The extension **must** appear in `service.extensions` so `splunkfw_init()` and the native conf cache initialization complete before `Start()` is called on downstream components.
+The extension **must** appear in `service.extensions` so `splunkfw_init()` completes before `Start()` is called on downstream components.
 
-On startup the extension creates the native `ConfManager` handle. That calls `confmgmt_create()`, which reads and merges the layered `.conf` files under `$SPLUNK_HOME/etc/` into the Splunk `PropertyPages` cache. Receivers, processors, and exporters can then call `fw.ConfManager()` and use `Get`, `Set`, `GetStanza`, `ListStanzas`, `DeleteStanza`, `DeleteKey`, and `Reload` without knowing about CGo.
+The native `ConfManager` handle is created lazily when callers use `fw.ConfManager()`, or eagerly when `management_port` is set so the REST management surface can start. It calls `confmgmt_create()`, which reads and merges the layered `.conf` files under `$SPLUNK_HOME/etc/` into the Splunk `PropertyPages` cache. Receivers, processors, and exporters can then use `Get`, `Set`, `GetStanza`, `ListStanzas`, `DeleteStanza`, `DeleteKey`, and `Reload` without knowing about CGo.
 
 The tail receiver calls `fw.NewMonitorPipeline()`. That method validates that `inputs.conf` contains enabled `monitor://` stanzas, then starts the native TailManager without injecting receiver-side monitor stanzas. TailManager reads the merged `inputs.conf` cache directly, so native monitor behavior remains intact for settings such as `blacklist`, `whitelist`, `recursive`, `crcSalt`, `ignoreOlderThan`, and fishbucket position state. To add input files, create `monitor://` stanzas in `inputs.conf` or through the supported `configs/conf-inputs` REST API; do not configure monitors on the receiver.
 

@@ -34,6 +34,8 @@ extensions:
 receivers:
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunktailreceiver v0.0.1
     path: /home/chli/otel/opentelemetry-collector-contrib/receiver/splunktailreceiver
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunkexecreceiver v0.0.1
+    path: /home/chli/otel/opentelemetry-collector-contrib/receiver/splunkexecreceiver
 
 exporters:
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/splunktcpoutexporter v0.0.1
