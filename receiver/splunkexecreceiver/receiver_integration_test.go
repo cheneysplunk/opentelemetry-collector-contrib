@@ -8,9 +8,14 @@ package splunkexecreceiver
 import (
 	"context"
 	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +48,8 @@ type capturedLog struct {
 
 type logsSink struct {
 	records chan capturedLog
+	mu      sync.Mutex
+	seen    []capturedLog
 }
 
 func newLogsSink() *logsSink {
@@ -76,6 +83,9 @@ func (s *logsSink) ConsumeLogs(_ context.Context, ld plog.Logs) error {
 				if value, ok := lr.Attributes().Get("splunk.sourcetype"); ok {
 					record.sourcetype = value.Str()
 				}
+				s.mu.Lock()
+				s.seen = append(s.seen, record)
+				s.mu.Unlock()
 				select {
 				case s.records <- record:
 				default:
@@ -89,6 +99,15 @@ func (s *logsSink) ConsumeLogs(_ context.Context, ld plog.Logs) error {
 func (s *logsSink) waitForMarker(marker string, timeout time.Duration) (capturedLog, error) {
 	deadline := time.After(timeout)
 	for {
+		s.mu.Lock()
+		for _, record := range s.seen {
+			if strings.Contains(record.body, marker) {
+				s.mu.Unlock()
+				return record, nil
+			}
+		}
+		s.mu.Unlock()
+
 		select {
 		case record := <-s.records:
 			if strings.Contains(record.body, marker) {
@@ -100,78 +119,68 @@ func (s *logsSink) waitForMarker(marker string, timeout time.Duration) (captured
 	}
 }
 
-func TestSplunkExecReceiverInputsThroughFrameworkExtension(t *testing.T) {
+type execFixtureApp struct {
+	Name             string
+	SourceDir        string
+	InstalledAppName string
+	InputsConfPath   string
+}
+
+func TestSplunkExecReceiverRunsFixtureAppInputsConf(t *testing.T) {
 	ctx := context.Background()
 	splunkHome, splunkDB := setupSplunkTestEnv(t, "otel_exec_db_")
+	removeOldExecTestFixtures(t, splunkHome)
 
-	scriptedMarker := "otel-exec-scripted-ok"
-	scriptPath := writeScriptedInput(t, splunkHome, scriptedMarker)
+	lineMarker := "otel-python-file-line-" + uniqueSuffix()
+	inputPath := filepath.Join(t.TempDir(), "input.txt")
+	writeFile(t, inputPath, lineMarker+"\n"+lineMarker+"-second\n", 0644)
 
-	modularMarker := "otel-exec-modular-ok"
-	scheme := "otel_exec_modinput_" + uniqueSuffix()
-	writeModularInputApp(t, splunkHome, scheme, modularMarker)
+	rest := newFakeConfRESTServer(t)
+	fixture := execFixtureApp{
+		Name:             "Python file modular input",
+		SourceDir:        filepath.Join("testdata", "python_file_modinput_app"),
+		InstalledAppName: "otel_exec_python_file_app",
+		InputsConfPath:   filepath.Join("default", "inputs.conf"),
+	}
+	inputsConf := installFixtureApp(t, splunkHome, fixture, map[string]string{
+		"OTEL_EXEC_TEST_FILE":     inputPath,
+		"OTEL_EXEC_TEST_REST_URL": rest.URL,
+		"OTEL_EXEC_TEST_MARKER":   lineMarker,
+	})
 
 	frameworkID, framework := startFrameworkExtension(t, ctx, splunkHome, splunkDB)
-
-	t.Run("scripted input", func(t *testing.T) {
-		sink := newLogsSink()
-		rcv := startExecReceiver(t, ctx, frameworkID, framework, sink, &Config{
-			Framework: frameworkID,
-			Scripts: []ScriptConfig{{
-				Command:      scriptPath,
-				Interval:     "-1",
-				Sourcetype:   "otel_exec_scripted",
-				Index:        "main",
-				Host:         "otel-exec-scripted-host",
-				Source:       "otel_exec_scripted_source",
-				StartByShell: false,
-			}},
-		})
-		t.Cleanup(func() {
-			if err := rcv.Shutdown(ctx); err != nil {
-				t.Errorf("receiver shutdown failed: %v", err)
-			}
-		})
-
-		record, err := sink.waitForMarker(scriptedMarker, 30*time.Second)
-		if err != nil {
-			t.Fatal(err)
+	sink := newLogsSink()
+	rcv := startExecReceiver(t, ctx, frameworkID, framework, sink, &Config{
+		Framework:  frameworkID,
+		InputsConf: inputsConf,
+	})
+	t.Cleanup(func() {
+		if err := rcv.Shutdown(ctx); err != nil {
+			t.Errorf("receiver shutdown failed: %v", err)
 		}
-		assertCapturedLog(t, record, "otel_exec_scripted_source", "otel_exec_scripted", "otel-exec-scripted-host")
 	})
 
-	t.Run("modular input", func(t *testing.T) {
-		sink := newLogsSink()
-		rcv := startExecReceiver(t, ctx, frameworkID, framework, sink, &Config{
-			Framework: frameworkID,
-			InputsConf: fmt.Sprintf(`
-[%s]
-run_introspection = true
-run_only_one = false
+	record, err := sink.waitForMarker(lineMarker, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCapturedLog(t, record, "otel_exec_python_file_input_source", "otel_exec_python_file_input", "otel-python-file-host")
 
-[%s://example]
-disabled = 0
-interval = -1
-marker = %s
-sourcetype = otel_exec_modular
-source = otel_exec_modular_source
-host = otel-exec-modular-host
-index = main
-start_by_shell = false
-`, scheme, scheme, modularMarker),
-		})
-		t.Cleanup(func() {
-			if err := rcv.Shutdown(ctx); err != nil {
-				t.Errorf("receiver shutdown failed: %v", err)
-			}
-		})
+	status, err := sink.waitForMarker("otel_exec_python_file_input_rest_status=ok", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status.body, "conf=otel_exec_python_file_test") {
+		t.Fatalf("REST status did not include conf name: %q", status.body)
+	}
+	if !strings.Contains(status.body, "python_executable=") {
+		t.Fatalf("REST status did not include python executable: %q", status.body)
+	}
+	if !strings.Contains(status.body, "python3.9") {
+		t.Fatalf("REST status did not use python.required interpreter: %q", status.body)
+	}
 
-		record, err := sink.waitForMarker(modularMarker, 30*time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		assertCapturedLog(t, record, "otel_exec_modular_source", "otel_exec_modular", "otel-exec-modular-host")
-	})
+	rest.AssertCRUD(t)
 }
 
 func setupSplunkTestEnv(t *testing.T, dbPrefix string) (string, string) {
@@ -264,90 +273,138 @@ func startExecReceiver(
 	return rcv
 }
 
-func writeScriptedInput(t *testing.T, splunkHome string, marker string) string {
+func installFixtureApp(
+	t *testing.T,
+	splunkHome string,
+	fixture execFixtureApp,
+	replacements map[string]string,
+) string {
 	t.Helper()
 
-	scriptPath := filepath.Join(splunkHome, "bin", "scripts", "otel_exec_scripted_input_"+uniqueSuffix()+".sh")
-	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
-		t.Fatalf("create script dir: %v", err)
+	if fixture.SourceDir == "" {
+		t.Fatal("fixture source dir is required")
 	}
-	body := fmt.Sprintf("#!/bin/sh\nprintf '%s pid=%%s\\n' \"$$\"\n", marker)
-	if err := os.WriteFile(scriptPath, []byte(body), 0755); err != nil {
-		t.Fatalf("write scripted input: %v", err)
+	if fixture.InstalledAppName == "" {
+		t.Fatal("fixture installed app name is required")
 	}
-	if err := os.Chmod(scriptPath, 0755); err != nil {
-		t.Fatalf("chmod scripted input: %v", err)
+	if fixture.InputsConfPath == "" {
+		t.Fatal("fixture inputs.conf path is required")
 	}
-	t.Cleanup(func() {
-		if err := os.Remove(scriptPath); err != nil && !os.IsNotExist(err) {
-			t.Errorf("remove scripted input %q: %v", scriptPath, err)
-		}
-	})
-	return scriptPath
-}
+	if info, err := os.Stat(fixture.SourceDir); err != nil {
+		t.Fatalf("%s fixture is not available at %q: %v", fixture.Name, fixture.SourceDir, err)
+	} else if !info.IsDir() {
+		t.Fatalf("%s fixture source %q is not a directory", fixture.Name, fixture.SourceDir)
+	}
 
-func writeModularInputApp(t *testing.T, splunkHome string, scheme string, marker string) {
-	t.Helper()
-
-	appDir := filepath.Join(splunkHome, "etc", "apps", "otel_exec_modinput_app_"+uniqueSuffix())
+	renderedInputsConf := renderFixtureFile(t, filepath.Join(fixture.SourceDir, fixture.InputsConfPath), replacements)
+	appDir := filepath.Join(splunkHome, "etc", "apps", fixture.InstalledAppName)
+	if err := os.RemoveAll(appDir); err != nil {
+		t.Fatalf("remove stale %s fixture app %q: %v", fixture.Name, appDir, err)
+	}
 	t.Cleanup(func() {
 		if err := os.RemoveAll(appDir); err != nil {
-			t.Errorf("remove modular input app %q: %v", appDir, err)
+			t.Errorf("remove %s fixture app %q: %v", fixture.Name, appDir, err)
 		}
 	})
 
-	writeFile(t, filepath.Join(appDir, "default", "app.conf"), ""+
-		"[install]\n"+
-		"is_configured = 1\n"+
-		"\n"+
-		"[ui]\n"+
-		"is_visible = 0\n"+
-		"\n"+
-		"[launcher]\n"+
-		"version = 1.0.0\n"+
-		"author = splunkexecreceiver\n", 0644)
-	writeFile(t, filepath.Join(appDir, "README", "inputs.conf.spec"),
-		fmt.Sprintf("[%s://<name>]\nmarker = <marker>\n", scheme), 0644)
-	writeFile(t, filepath.Join(appDir, "bin", scheme+".sh"), fmt.Sprintf(`#!/bin/sh
-if [ "${1:-}" = "--scheme" ]; then
-cat <<'EOF'
-<scheme>
-  <title>OTel Exec Modular Input Test</title>
-  <description>Generated by splunkexecreceiver integration test.</description>
-  <streaming_mode>xml</streaming_mode>
-</scheme>
-EOF
-exit 0
-fi
-cat >/dev/null
-cat <<'EOF'
-<stream>
-  <event>
-    <data>%s</data>
-    <source>otel_exec_modular_source</source>
-    <sourcetype>otel_exec_modular</sourcetype>
-    <host>otel-exec-modular-host</host>
-    <index>main</index>
-  </event>
-</stream>
-EOF
-`, marker), 0755)
+	err := filepath.WalkDir(fixture.SourceDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(fixture.SourceDir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+
+		dst := filepath.Join(appDir, rel)
+		if d.IsDir() {
+			return os.MkdirAll(dst, 0755)
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if filepath.Clean(rel) == filepath.Clean(fixture.InputsConfPath) {
+			body = []byte(renderedInputsConf)
+		}
+		return writeBytes(dst, body, info.Mode().Perm())
+	})
+	if err != nil {
+		t.Fatalf("install %s fixture app: %v", fixture.Name, err)
+	}
+
+	return renderedInputsConf
+}
+
+func renderFixtureFile(t *testing.T, path string, replacements map[string]string) string {
+	t.Helper()
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture file %q: %v", path, err)
+	}
+
+	rendered := string(body)
+	for key, value := range replacements {
+		rendered = strings.ReplaceAll(rendered, "${"+key+"}", value)
+	}
+	if strings.Contains(rendered, "${") {
+		t.Fatalf("fixture file %q still contains an unresolved placeholder:\n%s", path, rendered)
+	}
+	return rendered
+}
+
+func removeOldExecTestFixtures(t *testing.T, splunkHome string) {
+	t.Helper()
+
+	patterns := []string{
+		filepath.Join(splunkHome, "bin", "scripts", "otel_exec_scripted_input_*.sh"),
+		filepath.Join(splunkHome, "etc", "apps", "otel_exec_modinput_app_*"),
+		filepath.Join(splunkHome, "etc", "apps", "otel_exec_gdi_signalfx_app*"),
+		filepath.Join(splunkHome, "etc", "apps", "otel_exec_python_file_app*"),
+	}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("glob old exec test fixtures %q: %v", pattern, err)
+		}
+		for _, match := range matches {
+			if err := os.RemoveAll(match); err != nil {
+				t.Fatalf("remove old exec test fixture %q: %v", match, err)
+			}
+		}
+	}
 }
 
 func writeFile(t *testing.T, path string, body string, perm os.FileMode) {
 	t.Helper()
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		t.Fatalf("create dir for %q: %v", path, err)
-	}
-	if err := os.WriteFile(path, []byte(body), perm); err != nil {
+	if err := writeBytes(path, []byte(body), perm); err != nil {
 		t.Fatalf("write %q: %v", path, err)
+	}
+}
+
+func writeBytes(path string, body []byte, perm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("create dir: %w", err)
+	}
+	if err := os.WriteFile(path, body, perm); err != nil {
+		return err
 	}
 	if perm&0111 != 0 {
 		if err := os.Chmod(path, perm); err != nil {
-			t.Fatalf("chmod %q: %v", path, err)
+			return err
 		}
 	}
+	return nil
 }
 
 func assertCapturedLog(t *testing.T, record capturedLog, source string, sourcetype string, host string) {
@@ -366,4 +423,169 @@ func assertCapturedLog(t *testing.T, record capturedLog, source string, sourcety
 
 func uniqueSuffix() string {
 	return fmt.Sprintf("%d_%d", os.Getpid(), time.Now().UnixNano())
+}
+
+type fakeConfRESTServer struct {
+	*httptest.Server
+	mu    sync.Mutex
+	calls []restCall
+	conf  map[string]map[string]string
+}
+
+type restCall struct {
+	method        string
+	path          string
+	authorization string
+}
+
+func newFakeConfRESTServer(t *testing.T) *fakeConfRESTServer {
+	t.Helper()
+
+	server := &fakeConfRESTServer{
+		conf: make(map[string]map[string]string),
+	}
+	server.Server = httptest.NewServer(http.HandlerFunc(server.handle))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func (s *fakeConfRESTServer) handle(w http.ResponseWriter, r *http.Request) {
+	call := restCall{
+		method:        r.Method,
+		path:          r.URL.Path,
+		authorization: r.Header.Get("Authorization"),
+	}
+	s.mu.Lock()
+	s.calls = append(s.calls, call)
+	s.mu.Unlock()
+
+	if r.URL.Path == "/services/auth/login" && r.Method == http.MethodPost {
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = w.Write([]byte("<response><sessionKey>fake-session</sessionKey></response>"))
+		return
+	}
+
+	confName, stanza, ok := parseConfPath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	switch {
+	case r.Method == http.MethodPost && stanza == "":
+		stanza = r.Form.Get("name")
+		if stanza == "" {
+			http.Error(w, "missing name", http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		s.conf[stanza] = formValuesWithoutName(r.Form)
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+	case r.Method == http.MethodGet && stanza != "":
+		s.mu.Lock()
+		_, exists := s.conf[stanza]
+		s.mu.Unlock()
+		if !exists {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"entry":[{"name":%q,"conf":%q}]}`, stanza, confName)))
+	case r.Method == http.MethodPost && stanza != "":
+		s.mu.Lock()
+		if _, exists := s.conf[stanza]; !exists {
+			s.conf[stanza] = make(map[string]string)
+		}
+		for key, values := range r.Form {
+			if len(values) > 0 {
+				s.conf[stanza][key] = values[0]
+			}
+		}
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	case r.Method == http.MethodDelete && stanza != "":
+		s.mu.Lock()
+		delete(s.conf, stanza)
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	default:
+		http.Error(w, "unsupported fake REST operation", http.StatusMethodNotAllowed)
+	}
+}
+
+func parseConfPath(path string) (string, string, bool) {
+	const marker = "/configs/conf-"
+	idx := strings.Index(path, marker)
+	if idx < 0 {
+		return "", "", false
+	}
+	rest := path[idx+len(marker):]
+	parts := strings.SplitN(rest, "/", 2)
+	confName, err := url.PathUnescape(parts[0])
+	if err != nil || confName == "" {
+		return "", "", false
+	}
+	if len(parts) == 1 {
+		return confName, "", true
+	}
+	stanza, err := url.PathUnescape(parts[1])
+	if err != nil {
+		return "", "", false
+	}
+	return confName, stanza, true
+}
+
+func formValuesWithoutName(values map[string][]string) map[string]string {
+	result := make(map[string]string)
+	for key, vals := range values {
+		if key == "name" || len(vals) == 0 {
+			continue
+		}
+		result[key] = vals[0]
+	}
+	return result
+}
+
+func (s *fakeConfRESTServer) AssertCRUD(t *testing.T) {
+	t.Helper()
+
+	s.mu.Lock()
+	calls := append([]restCall(nil), s.calls...)
+	s.mu.Unlock()
+
+	expected := []restCall{
+		{method: http.MethodPost, path: "/services/auth/login"},
+		{method: http.MethodPost, path: "/servicesNS/nobody/system/configs/conf-otel_exec_python_file_test"},
+		{method: http.MethodGet, path: "/servicesNS/nobody/system/configs/conf-otel_exec_python_file_test/exec_receiver"},
+		{method: http.MethodPost, path: "/servicesNS/nobody/system/configs/conf-otel_exec_python_file_test/exec_receiver"},
+		{method: http.MethodDelete, path: "/servicesNS/nobody/system/configs/conf-otel_exec_python_file_test/exec_receiver"},
+	}
+	for _, want := range expected {
+		if !hasRESTCall(calls, want) {
+			t.Fatalf("missing REST call %s %s; calls=%v", want.method, want.path, calls)
+		}
+	}
+	for _, call := range calls {
+		if call.path == "/services/auth/login" {
+			continue
+		}
+		if call.authorization != "Splunk fake-session" {
+			t.Fatalf("REST call %s %s used authorization %q, want Splunk fake-session", call.method, call.path, call.authorization)
+		}
+	}
+}
+
+func hasRESTCall(calls []restCall, want restCall) bool {
+	for _, call := range calls {
+		if call.method == want.method && call.path == want.path {
+			return true
+		}
+	}
+	return false
 }

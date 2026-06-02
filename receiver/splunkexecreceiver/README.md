@@ -115,15 +115,75 @@ With one `splunkexecreceiver` configured with 100 inputs, the expected shape is:
 up to 100 child processes only if 100 inputs are runnable or long-lived at once
 ```
 
-The main scaling pressure is therefore not pipeline set count. It is external
+Those inputs run as separate subprocesses when scheduled, but they share the
+same exec pipeline resources:
+
+```text
+100 configured inputs
+  -> shared ExecProcessor scheduler/run queue
+  -> child subprocesses launched as needed
+  -> stdout read from each running child
+  -> shared native pipeline input queue
+  -> shared parsing/event handling path
+  -> one Go callback/event channel
+  -> splunkexecreceiver forwards OTel logs downstream
+```
+
+The main scaling pressure is therefore not pipeline count. It is external
 process concurrency, process churn for short intervals, bytes emitted by child
-processes, parsing cost, queue memory, and downstream exporter throughput.
+processes, parsing cost, native queue memory, Go callback/channel throughput,
+and downstream exporter backpressure.
 
 ExecProcessor intentionally throttles startup through a run queue so many
 configured scripts are not launched all at once. A command is not re-entered
-while it is already running. If future work exposes multiple exec pipeline sets,
-treat that as bounded worker capacity, for example `2`, `4`, or `8`, not one
-pipeline set per input.
+while it is already running.
+
+## Performance considerations
+
+Today's preferred production shape is one `splunkexecreceiver` instance with all
+exec inputs configured in that receiver. This keeps one native exec pipeline and
+avoids multiplying Splunk runtime state.
+
+If many inputs are active at the same time, they can still compete for shared
+pipeline resources. For example, 100 long-running modular inputs can mean 100
+child processes emitting data in parallel into one shared native pipeline and
+one shared Go event channel. That can be healthy if each input is light, but it
+can become a bottleneck if inputs are CPU-heavy, emit large bursts, or run at
+very short intervals.
+
+Useful tuning and design levers are:
+
+| Lever | Effect |
+|---|---|
+| Increase input intervals | reduces process churn and burst frequency |
+| Avoid long-running noisy inputs when possible | reduces concurrent stdout pressure |
+| Keep one receiver but many inputs | preserves single native runtime ownership |
+| Use downstream batch/queue/exporter tuning | absorbs bursts after events become OTel logs |
+| Add per-input or global concurrency limits in future | caps active child process count |
+
+Potential future scaling work could expose a bounded exec pipeline count, for
+example `pipeline_count: 2`, `4`, or `8`. The receiver would shard input stanzas
+across those native exec pipelines instead of creating one pipeline per input.
+That would trade extra native pipeline memory and scheduling overhead for lower
+contention in each pipeline.
+
+A future multi-pipeline design could also reuse a receiver-side load-balancing
+or sharding layer:
+
+```text
+splunkexecreceiver
+  -> split rendered inputs.conf into N groups
+  -> fw.NewPipeline(InputsConf: group 0)
+  -> fw.NewPipeline(InputsConf: group 1)
+  -> ...
+  -> fan in Pipeline.Events() from all groups
+  -> forward one OTel logs stream downstream
+```
+
+That design should stay bounded and explicit. Prefer `N` pipelines as worker
+capacity, not `N` pipelines for `N` inputs. It would also require relaxing the
+current native C ABI active-handle guard and adding clear receiver-level
+lifecycle ownership for multiple exec pipelines.
 
 ## Single receiver constraint
 
@@ -153,16 +213,150 @@ Include both `splunkframeworkextension` and this receiver in the Collector
 Builder config. Only the extension needs CGo linker flags for
 `libsplunk_cabi.so`.
 
+## How it works
+
+At runtime the receiver has two jobs:
+
+1. Convert OTel receiver config into native Splunk `inputs.conf` stanza text.
+2. Ask `splunkframeworkextension` to start a native exec pipeline with that
+   stanza text.
+
+The startup flow is:
+
+```text
+Collector config
+  -> splunkexecreceiver
+  -> render inputs.conf text
+  -> splunkframeworkextension.NewPipeline(InputsConf: ...)
+  -> framework_cabi/libsplunk_cabi.so
+  -> native ExecProcessor
+  -> child input process
+  -> stdout XML/raw events
+  -> Go callback
+  -> OTel plog.Logs
+```
+
+For structured `scripts` config, `splunkexecreceiver` renders
+`[script://...]` stanzas itself. For modular inputs, pass raw native
+`inputs_conf` text so the scheme stanza, instance stanza, `python.required`,
+metadata, and app-specific parameters are preserved exactly.
+
+For Python modular inputs, the native `ExecProcessor` discovers the executable
+from the installed app under `$SPLUNK_HOME/etc/apps/<app>/bin`. When the command
+is a `.py` file, Splunk prepends the selected Splunk Python interpreter. In the
+test fixture that is:
+
+```ini
+[otel_exec_python_file_input]
+python.required = 3.9
+```
+
+So the launched process looks like:
+
+```text
+/home/chli/splunk_home/bin/python3.9 \
+  /home/chli/splunk_home/etc/apps/otel_exec_python_file_app/bin/otel_exec_python_file_input.py
+```
+
+The fixture app's input reads Splunk modular input XML from stdin, reads the
+configured file path, emits one XML `<event>` per line, and then calls the
+configured REST root to create, read, update, and delete a conf stanza.
+
 ## Tests
 
-The integration test `TestSplunkExecReceiverInputsThroughFrameworkExtension`
-starts `splunkframeworkextension` once and verifies both input types through the
-real extension path:
+The integration test `TestSplunkExecReceiverRunsFixtureAppInputsConf` starts
+`splunkframeworkextension` once and runs a real fixture app from
+`testdata/python_file_modinput_app`.
 
-| Subtest | Fixture |
+The fixture app contains:
+
+| Path | Purpose |
 |---|---|
-| `scripted input` | temporary `$SPLUNK_HOME/bin/scripts/otel_exec_scripted_input_*.sh` |
-| `modular input` | temporary app under `$SPLUNK_HOME/etc/apps/otel_exec_modinput_app_*` |
+| `default/app.conf` | minimal Splunk app metadata |
+| `default/inputs.conf` | real modular input config used by the test |
+| `README/inputs.conf.spec` | modular input spec |
+| `bin/otel_exec_python_file_input.py` | Python modular input implementation |
 
-Both tests assert that native exec output is delivered as OTel logs with the
-expected `host.name`, `splunk.source`, and `splunk.sourcetype` metadata.
+The test uses a generic fixture-app helper. It copies the app into
+`$SPLUNK_HOME/etc/apps`, renders placeholders in the fixture's
+`default/inputs.conf`, and feeds that rendered text to the receiver's
+`inputs_conf` setting. This matches the receiver's current startup path:
+`splunkexecreceiver` explicitly calls `fw.NewPipeline(InputsConf: ...)`; it does
+not yet auto-scan installed app `default/inputs.conf` files by itself.
+
+To reuse the test harness for another input, add another app under `testdata`,
+include a real `default/inputs.conf`, and call `installFixtureApp` with the
+fixture directory, installed app name, and any runtime placeholder values.
+
+The Python fixture verifies:
+
+| Feature | Verification |
+|---|---|
+| input scheduler | `interval = -1` runs the modular input once |
+| direct `.py` launch | native `ExecProcessor` prepends Splunk Python selected by `python.required = 3.9` |
+| stdin/stdout protocol | the input parses Splunk modular input XML and emits XML events |
+| file ingestion | each line from the configured file becomes a log record |
+| REST config CRUD | the input calls `/services/auth/login` and `/servicesNS/nobody/system/configs/conf-*` |
+
+The same `rest_url` field can point at the `splunkframeworkextension`
+management port when native REST is enabled.
+
+### Run the integration test
+
+From the receiver directory:
+
+```bash
+cd /home/chli/otel/opentelemetry-collector-contrib/receiver/splunkexecreceiver
+```
+
+Check the Python modular input syntax:
+
+```bash
+python3 -m py_compile \
+  testdata/python_file_modinput_app/bin/otel_exec_python_file_input.py
+rm -rf testdata/python_file_modinput_app/bin/__pycache__
+```
+
+Run only this receiver's tests through the real Splunk framework C ABI:
+
+```bash
+CGO_LDFLAGS='-L/home/chli/main/src/framework_cabi -Wl,-rpath,/home/chli/main/src/framework_cabi -Wl,-rpath,/home/chli/splunk_home/lib -lsplunk_cabi -lstdc++ -ldl -lpthread' \
+LD_LIBRARY_PATH='/home/chli/main/src/framework_cabi:/home/chli/splunk_home/lib' \
+SPLUNK_HOME=/home/chli/splunk_home \
+go test ./... -count=1 -v
+```
+
+Run just the fixture app integration test:
+
+```bash
+CGO_LDFLAGS='-L/home/chli/main/src/framework_cabi -Wl,-rpath,/home/chli/main/src/framework_cabi -Wl,-rpath,/home/chli/splunk_home/lib -lsplunk_cabi -lstdc++ -ldl -lpthread' \
+LD_LIBRARY_PATH='/home/chli/main/src/framework_cabi:/home/chli/splunk_home/lib' \
+SPLUNK_HOME=/home/chli/splunk_home \
+go test . -run TestSplunkExecReceiverRunsFixtureAppInputsConf -count=1 -v
+```
+
+A successful run should include:
+
+```text
+New scheduled exec process: /home/chli/splunk_home/bin/python3.9 ...
+--- PASS: TestSplunkExecReceiverRunsFixtureAppInputsConf
+PASS
+```
+
+The test asserts all of these behaviors:
+
+| Assertion | What it proves |
+|---|---|
+| file marker log is received | scheduler launched the input and file lines became OTel logs |
+| `splunk.source`, `splunk.sourcetype`, `host.name` match | native metadata survived receiver conversion |
+| REST status log contains `conf=otel_exec_python_file_test` | the input completed REST CRUD |
+| REST fake server saw login, create, read, update, delete | conf management calls used the expected endpoints |
+| status log contains `python3.9` | `.py` was launched through Splunk Python from `python.required` |
+
+To inspect the modular input scheme manually:
+
+```bash
+/home/chli/splunk_home/bin/python3.9 \
+  testdata/python_file_modinput_app/bin/otel_exec_python_file_input.py \
+  --scheme
+```
